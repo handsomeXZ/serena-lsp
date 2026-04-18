@@ -1,19 +1,25 @@
+import json
 import os
 import socket
+import sys
 import threading
-from collections.abc import Callable
+import urllib.error
+import urllib.request
+from html import escape
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
 from flask import Flask, Response, redirect, request, send_from_directory
 from pydantic import BaseModel
 from sensai.util import logging
+from sensai.util.pickle import dump_pickle, load_pickle
 
 from serena.analytics import ToolUsageStats
 from serena.config.serena_config import SerenaConfig, SerenaPaths
 from serena.constants import SERENA_DASHBOARD_DIR
 from serena.task_executor import TaskExecutor
 from serena.util.logging import MemoryLogHandler
+from serena.util.pywebview import WebViewWithTray
 
 if TYPE_CHECKING:
     from serena.agent import SerenaAgent
@@ -57,6 +63,7 @@ class ResponseConfigOverview(BaseModel):
     languages: list[str]
     encoding: str | None
     current_client: str | None
+    serena_version: str
 
 
 class ResponseAvailableLanguages(BaseModel):
@@ -124,6 +131,54 @@ class QueuedExecution(BaseModel):
         )
 
 
+class ReadNews:
+    def __init__(self, read_ids: list[str], legacy_last_read_id: str | None = None):
+        self._read_ids = set(read_ids)
+        self._legacy_last_read_id = legacy_last_read_id
+
+    @staticmethod
+    def load() -> "ReadNews":
+        read_news_path = SerenaPaths().news_read_items_file
+        legacy_last_read_id_path = SerenaPaths().news_legacy_last_read_id_file
+
+        def load_legacy_last_read_id() -> str | None:
+            if not os.path.exists(legacy_last_read_id_path):
+                return None
+            with open(legacy_last_read_id_path, encoding="utf-8") as f:
+                last_read_news_id = f.read().strip()
+                if last_read_news_id == "20262103":
+                    last_read_news_id = "20260321"  # fix originally misnamed news id
+                return last_read_news_id
+
+        if os.path.exists(read_news_path):
+            return load_pickle(read_news_path)
+        else:
+            instance = ReadNews(read_ids=[], legacy_last_read_id=load_legacy_last_read_id())
+            instance._save()
+            try:
+                os.unlink(legacy_last_read_id_path)
+            except:
+                pass
+            return instance
+
+    def _save(self) -> None:
+        dump_pickle(self, SerenaPaths().news_read_items_file)
+
+    def is_read(self, identifier: str) -> bool:
+        if identifier in self._read_ids:
+            return True
+        if self._legacy_last_read_id is not None and identifier <= self._legacy_last_read_id:
+            return True
+        return False
+
+    def mark_read(self, identifier: str) -> None:
+        """
+        Marks the given news snippet as read, saving the new state to disk
+        """
+        self._read_ids.add(identifier)
+        self._save()
+
+
 class SerenaDashboardAPI:
     log = logging.getLogger(__qualname__)
 
@@ -132,16 +187,19 @@ class SerenaDashboardAPI:
         memory_log_handler: MemoryLogHandler,
         tool_names: list[str],
         agent: "SerenaAgent",
-        shutdown_callback: Callable[[], None] | None = None,
         tool_usage_stats: ToolUsageStats | None = None,
     ) -> None:
         self._memory_log_handler = memory_log_handler
         self._tool_names = tool_names
         self._agent = agent
-        self._shutdown_callback = shutdown_callback
         self._app = Flask(__name__)
         self._tool_usage_stats = tool_usage_stats
+        self._loaded_news: dict[str, str] = {}
+        self._news_ready = threading.Event()
         self._setup_routes()
+        self._read_news = ReadNews.load()
+        # Fetch remote news in background on startup (non-blocking)
+        threading.Thread(target=self._fetch_news, daemon=True).start()
 
     @property
     def memory_log_handler(self) -> MemoryLogHandler:
@@ -210,7 +268,7 @@ class SerenaDashboardAPI:
 
         @self._app.route("/shutdown", methods=["PUT"])
         def shutdown() -> dict[str, str]:
-            self._shutdown()
+            self._agent.shutdown()
             return {"status": "shutting down"}
 
         @self._app.route("/get_available_languages", methods=["GET"])
@@ -331,7 +389,7 @@ class SerenaDashboardAPI:
                 return {
                     "status": "success",
                     "was_cancelled": False,
-                    "message": f"Task with id {request_data.get('task_id')} not found, maybe execution was already finished",
+                    "message": f"Task with id {escape(request_data.get('task_id'))} not found, maybe execution was already finished",
                 }
             except Exception as e:
                 return {"status": "error", "message": str(e), "was_cancelled": False}
@@ -345,34 +403,30 @@ class SerenaDashboardAPI:
             except Exception as e:
                 return {"status": "error", "message": str(e)}
 
-        @self._app.route("/news_snippet_ids", methods=["GET"])
-        def get_news_snippet_ids() -> dict[str, str | list[int]]:
-            def _get_unread_news_ids() -> list[int]:
-                all_news_files = (Path(SERENA_DASHBOARD_DIR) / "news").glob("*.html")
-                all_news_ids = [int(f.stem) for f in all_news_files]
-                """News ids are ints of format YYYYMMDD (publication dates)"""
+        @self._app.route("/fetch_unread_news", methods=["GET"])
+        def fetch_unread_news() -> dict[str, dict[str, str] | str]:
+            def _fetch_unread_news() -> dict[str, str]:
+                """News ids are strings of format YYYYMMDD (publication dates)"""
+                self._news_ready.wait()
+                all_news = self._loaded_news
 
-                # Filter news items by installation date
                 serena_config_creation_date = SerenaConfig.get_config_file_creation_date()
                 if serena_config_creation_date is None:
                     # should not normally happen, since config file should exist when the dashboard is started
                     # We assume a fresh installation in this case
                     log.error("Serena config file not found when starting the dashboard")
-                    return []
-                serena_config_creation_date_int = int(serena_config_creation_date.strftime("%Y%m%d"))
-                # Only include news items published on or after the installation date
-                post_installation_news_ids = [news_id for news_id in all_news_ids if news_id >= serena_config_creation_date_int]
+                    return {}
+                serena_config_creation_date = serena_config_creation_date.strftime("%Y%m%d")
 
-                news_snippet_id_file = SerenaPaths().news_snippet_id_file
-                if not os.path.exists(news_snippet_id_file):
-                    return post_installation_news_ids
-                with open(news_snippet_id_file, encoding="utf-8") as f:
-                    last_read_news_id = int(f.read().strip())
-                return [news_id for news_id in post_installation_news_ids if news_id > last_read_news_id]
+                # filter for news after the installation date
+                post_installation_news = {k: v for k, v in all_news.items() if k >= serena_config_creation_date}
+
+                # read unread news
+                return {k: v for k, v in post_installation_news.items() if not self._read_news.is_read(k)}
 
             try:
-                unread_news_ids = _get_unread_news_ids()
-                return {"news_snippet_ids": unread_news_ids, "status": "success"}
+                unread_news = _fetch_unread_news()
+                return {"news": unread_news, "status": "success"}
             except Exception as e:
                 return {"status": "error", "message": str(e)}
 
@@ -380,10 +434,8 @@ class SerenaDashboardAPI:
         def mark_news_snippet_as_read() -> dict[str, str]:
             try:
                 request_data = request.get_json()
-                news_snippet_id = int(request_data.get("news_snippet_id"))
-                news_snippet_id_file = SerenaPaths().news_snippet_id_file
-                with open(news_snippet_id_file, "w", encoding="utf-8") as f:
-                    f.write(str(news_snippet_id))
+                news_snippet_id = escape(str(request_data.get("news_snippet_id")))
+                self._read_news.mark_read(news_snippet_id)
                 return {"status": "success", "message": f"Marked news snippet {news_snippet_id} as read"}
             except Exception as e:
                 return {"status": "error", "message": str(e)}
@@ -532,16 +584,8 @@ class SerenaDashboardAPI:
             languages=languages,
             encoding=encoding,
             current_client=Tool.get_last_tool_call_client_str(),
+            serena_version=self._agent.version,
         )
-
-    def _shutdown(self) -> None:
-        log.info("Shutting down Serena")
-        if self._shutdown_callback:
-            self._shutdown_callback()
-        else:
-            # noinspection PyProtectedMember
-            # noinspection PyUnresolvedReferences
-            os._exit(0)
 
     def _get_available_languages(self) -> ResponseAvailableLanguages:
         from solidlsp.ls_config import Language
@@ -623,6 +667,66 @@ class SerenaDashboardAPI:
 
         self._agent.execute_task(run, logged=True, name="SaveSerenaConfig")
 
+    # ===== Remote News Methods =====
+
+    # The branch from which news are fetched. Change to a feature branch for testing.
+    _NEWS_JSON_URL = "https://oraios-software.de/serena_news.json"
+
+    def _fetch_news(self) -> None:
+        """Fetch news.json from GitHub using ETag-based caching and store in memory. Silently ignores network errors."""
+        paths = SerenaPaths()
+
+        headers: dict[str, str] = {}
+        # Load stored ETag if available
+        if os.path.exists(paths.news_etag_file) and os.path.exists(paths.news_file):
+            try:
+                with open(paths.news_etag_file, encoding="utf-8") as f:
+                    stored_etag = f.read().strip()
+                if stored_etag:
+                    headers["If-None-Match"] = stored_etag
+            except Exception:
+                log.warning("Failed to read stored news ETag at %s, proceeding without it", paths.news_etag_file, exc_info=True)
+
+        fetched_news_dict = None
+        try:
+            req = urllib.request.Request(self._NEWS_JSON_URL, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as response:
+                etag = response.headers.get("ETag", "")
+                body = response.read().decode("utf-8")
+                # Validate JSON
+                fetched_news_dict = json.loads(body)
+                # Store news content and ETag
+                with open(paths.news_file, "w", encoding="utf-8") as f:
+                    f.write(body)
+                if etag:
+                    with open(paths.news_etag_file, "w", encoding="utf-8") as f:
+                        f.write(etag)
+                log.info("Remote news updated from %s", self._NEWS_JSON_URL)
+        except urllib.error.HTTPError as e:
+            if e.code == 304:
+                log.debug("Remote news unchanged (304 Not Modified)")
+            else:
+                log.warning("Failed to fetch remote news (HTTP %d): %s", e.code, e.reason)
+        except Exception as e:
+            log.warning("Failed to fetch remote news: %s", e)
+        if fetched_news_dict is None:
+            fetched_news_dict = self._load_previously_fetched_news_data()
+        self._loaded_news = fetched_news_dict
+        self._news_ready.set()
+
+    @staticmethod
+    def _load_previously_fetched_news_data() -> dict[str, str]:
+        """Return the news data dict. Uses local cache if available, otherwise falls back to local news files."""
+        paths = SerenaPaths()
+
+        if os.path.exists(paths.news_file):
+            try:
+                with open(paths.news_file, encoding="utf-8") as f:
+                    return json.loads(f.read())
+            except Exception:
+                log.warning("Failed to read cached news data from %s", paths.news_file)
+        return {}
+
     def _add_language(self, request_add_language: RequestAddLanguage) -> None:
         from solidlsp.ls_config import Language
 
@@ -674,3 +778,65 @@ class SerenaDashboardAPI:
         thread = threading.Thread(target=lambda: self.run(host=host, port=port), daemon=True)
         thread.start()
         return thread, port
+
+
+class SerenaDashboardViewer(WebViewWithTray):
+    """
+    Minimal pywebview wrapper with optional system tray.
+    """
+
+    DEBUG = False
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        width: int = 1400,
+        height: int = 900,
+        start_minimized: bool = False,
+        parent_process_id: int | None = None,
+        tray: bool = True,
+    ):
+        dashboard_path = Path(SERENA_DASHBOARD_DIR)
+
+        # .ico is Windows-only; macOS expects a PNG for the window/dock icon.
+        app_icon_filename = "serena.ico" if sys.platform == "win32" else "serena-icon-1024-mac.png"
+        app_icon_path = str(dashboard_path / app_icon_filename)
+
+        tray_icon_filename = "serena-icon-tray-mac.png" if sys.platform == "darwin" else "serena-icon-48.png"
+        tray_icon_path = str(dashboard_path / tray_icon_filename)
+
+        super().__init__(
+            url,
+            title="Serena Dashboard",
+            tray=tray,
+            width=width,
+            height=height,
+            start_minimized=start_minimized,
+            parent_process_id=parent_process_id,
+            app_id="oraios.serena",
+            app_icon_path=app_icon_path,
+            tray_icon_path=tray_icon_path,
+        )
+
+    @staticmethod
+    def is_current_platform_supported() -> bool:
+        """
+        :return: whether the current platform supports the dashboard viewer
+        """
+        # The dashboard viewer (with system tray) is technically supported only on Windows and macOS.
+        # Linux support is problematic; see https://github.com/oraios/serena/pull/1117#issuecomment-4128753943
+        supported_platforms = [
+            "win32",
+            # NOTE: Disabling macOS support for now, because the tray behaviour is suboptimal (too many icons when
+            #   subagents are spawned, etc.)
+            # "darwin"
+        ]
+        return sys.platform in supported_platforms
+
+    def run(self) -> None:
+        if self.DEBUG:
+            logging.configure(level=logging.DEBUG)
+            logging.add_file_logger(SerenaPaths().get_next_log_file_path("dashboard-viewer"))
+
+        super().run()

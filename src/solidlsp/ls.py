@@ -48,7 +48,13 @@ from solidlsp.lsp_protocol_handler.server import (
 from solidlsp.settings import SolidLSPSettings
 from solidlsp.util.cache import load_cache, save_cache
 
-GenericDocumentSymbol = Union[LSPTypes.DocumentSymbol, LSPTypes.SymbolInformation, ls_types.UnifiedSymbolInformation]
+RawDocumentSymbol = Union[DocumentSymbol, SymbolInformation]
+"""
+Type alias for the raw symbol information returned by a language server in response to a
+`textDocument/documentSymbol` request.
+The `DocumentSymbol` is the preferred type, but the legacy type `SymbolInformation` is also still used.
+"""
+
 log = logging.getLogger(__name__)
 
 _debug_enabled = log.isEnabledFor(logging.DEBUG)
@@ -211,7 +217,7 @@ class SymbolBodyFactory:
     def __init__(self, file_buffer: LSPFileBuffer):
         self._lines = file_buffer.split_lines()
 
-    def create_symbol_body(self, symbol: GenericDocumentSymbol) -> SymbolBody:
+    def create_symbol_body(self, symbol: UnifiedSymbolInformation) -> SymbolBody:
         existing_body = symbol.get("body", None)
         if existing_body and isinstance(existing_body, SymbolBody):
             return existing_body
@@ -347,13 +353,35 @@ class SolidLanguageServer(ABC):
     DOCUMENT_SYMBOL_CACHE_VERSION = 4
     DOCUMENT_SYMBOL_CACHE_FILENAME = "document_symbols.pkl"
 
+    # Directories that should always be ignored regardless of language:
+    # VCS internals, virtual environments, caches, and serena's own data.
+    _ALWAYS_IGNORED_DIRS = frozenset(
+        {
+            ".git",
+            ".svn",
+            ".hg",
+            ".bzr",  # VCS
+            ".venv",
+            ".env",  # virtual environments
+            ".cache",
+            ".mypy_cache",
+            ".pytest_cache",
+            ".ruff_cache",  # caches
+            ".tox",
+            ".nox",  # test runners
+            ".idea",  # IDE internals
+            ".serena",  # serena's own data
+            ".vscode",  # Doesn't contain symbols
+        }
+    )
+
     # To be overridden and extended by subclasses
     def is_ignored_dirname(self, dirname: str) -> bool:
         """
         A language-specific condition for directories that should always be ignored. For example, venv
         in Python and node_modules in JS/TS should be ignored always.
         """
-        return dirname.startswith(".")
+        return dirname in self._ALWAYS_IGNORED_DIRS
 
     @staticmethod
     def _determine_log_level(line: str) -> int:
@@ -1262,7 +1290,7 @@ class SolidLanguageServer(ABC):
         The returned symbols are considered "raw document symbols" (in contrast to processed symbols returned by `request_document_symbols`).
 
         NOTE: This method can be overridden in subclasses to post-process the raw results.
-              When doing so, be sure to update the init parameter `cache_version_raw_document_symbols`
+              When doing so after the initial implementation, be sure to update the init parameter `cache_version_raw_document_symbols`
               to a different version (add 1) to ensure that all caches are invalidated appropriately.
               IMPORTANT: Since rebuilding the raw document symbol cache from the language server results
               is potentially expensive, prefer overriding the `request_document_symbols` method
@@ -1303,22 +1331,42 @@ class SolidLanguageServer(ABC):
                 {"textDocument": {"uri": pathlib.Path(os.path.join(self.repository_root_path, relative_file_path)).as_uri()}}
             )
 
-            # update cache
-            self._raw_document_symbols_cache[cache_key] = (fd.content_hash, response)
-            self._raw_document_symbols_cache_is_modified = True
+            # Only cache non-empty results. An empty or None response can occur when the language server
+            # has not yet finished indexing or building the project (e.g. Lean 4 before `lake build`),
+            # and caching it would permanently serve stale data even after the project is ready.
+            if response:
+                self._raw_document_symbols_cache[cache_key] = (fd.content_hash, response)
+                self._raw_document_symbols_cache_is_modified = True
 
             return response
 
         with self._open_file_context(relative_file_path, file_buffer=file_data) as fd:
             return get_raw_document_symbols(fd)
 
+    def _normalize_symbol_name(self, symbol: RawDocumentSymbol, relative_file_path: str) -> str:
+        """
+        Normalizes the name of the given symbol, e.g. by removing parameter lists from method symbols.
+
+        Override this method in subclasses to implement language-specific normalization logic.
+        NOTE: When changing the override of this method after the initial LS implementation,
+              be sure to also override `_document_symbols_cache_fingerprint` in order to ensure that
+              the caches are invalidated appropriately.
+
+        :param symbol: the symbol
+        :param relative_file_path: the relative path of the file the symbol is located in
+        :return: the normalized name of the symbol
+        """
+        # the default implementation does not change the name
+        return symbol["name"]
+
     def request_document_symbols(self, relative_file_path: str, file_buffer: LSPFileBuffer | None = None) -> DocumentSymbols:
         """
         Retrieves the collection of symbols in the given file.
 
         NOTE: This method can be overridden in subclasses to post-process the results.
-              When doing so, be sure to also override `_document_symbols_cache_fingerprint`
+              When doing so after the initial LS implementation, be sure to also override `_document_symbols_cache_fingerprint`
               to ensure that the caches are invalidated appropriately.
+              DO NOT override this method to modify symbol names; override `_normalize_symbol_name` instead.
 
         :param relative_file_path: The relative path of the file that has the symbols
         :param file_buffer: an optional file buffer if the file is already opened.
@@ -1362,7 +1410,7 @@ class SolidLanguageServer(ABC):
 
             body_factory = SymbolBodyFactory(file_data)
 
-            def convert_to_unified_symbol(original_symbol_dict: GenericDocumentSymbol) -> ls_types.UnifiedSymbolInformation:
+            def convert_to_unified_symbol(original_symbol_dict: RawDocumentSymbol) -> ls_types.UnifiedSymbolInformation:
                 """
                 Converts the given symbol dictionary to the unified representation, ensuring
                 that all required fields are present (except 'children' which is handled separately).
@@ -1403,16 +1451,23 @@ class SolidLanguageServer(ABC):
                 return item
 
             def convert_symbols_with_common_parent(
-                symbols: list[DocumentSymbol] | list[SymbolInformation] | list[UnifiedSymbolInformation],
+                symbols: list[DocumentSymbol] | list[SymbolInformation],
                 parent: ls_types.UnifiedSymbolInformation | None,
             ) -> list[ls_types.UnifiedSymbolInformation]:
                 """
                 Converts the given symbols into UnifiedSymbolInformation with proper parent-child relationships,
                 adding overload indices for symbols with the same name under the same parent.
                 """
+                # apply name normalization and count occurrences of each symbol name
                 total_name_counts: dict[str, int] = defaultdict(lambda: 0)
                 for symbol in symbols:
-                    total_name_counts[symbol["name"]] += 1
+                    name = self._normalize_symbol_name(symbol, relative_file_path=relative_file_path)
+                    symbol["name"] = name
+                    total_name_counts[name] += 1
+
+                # convert symbols to the unified representation and
+                #  * add overload indices where necessary
+                #  * ensure that the "parent" field is set correctly
                 name_counts: dict[str, int] = defaultdict(lambda: 0)
                 unified_symbols = []
                 for symbol in symbols:
@@ -1639,6 +1694,7 @@ class SolidLanguageServer(ABC):
     def request_overview(self, within_relative_path: str) -> dict[str, list[UnifiedSymbolInformation]]:
         """
         An overview of all symbols in the given file or directory.
+        Raises a ValueError if a path to an ignored file is passed.
 
         :param within_relative_path: the relative path to the file or directory to get the overview of.
         :return: A mapping of all relative paths analyzed to lists of top-level symbols in the corresponding file.
@@ -1648,6 +1704,8 @@ class SolidLanguageServer(ABC):
             raise FileNotFoundError(f"File or directory not found: {abs_path}")
 
         if abs_path.is_file():
+            if self.is_ignored_path(within_relative_path):
+                raise ValueError(f"The explicitly passed file {within_relative_path} is ignored, not returning overview.")
             symbols_overview = self.request_document_overview(within_relative_path)
             return {within_relative_path: symbols_overview}
         else:
@@ -1727,7 +1785,7 @@ class SolidLanguageServer(ABC):
 
     def create_symbol_body(
         self,
-        symbol: ls_types.UnifiedSymbolInformation | LSPTypes.SymbolInformation,
+        symbol: ls_types.UnifiedSymbolInformation,
         factory: SymbolBodyFactory | None = None,
     ) -> SymbolBody:
         if factory is None:
