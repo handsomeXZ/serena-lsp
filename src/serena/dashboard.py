@@ -198,6 +198,18 @@ class SerenaDashboardAPI:
             self._memory_log_handler.clear_log_messages()
             return {"status": "cleared"}
 
+        @self._app.route("/pre_index_project", methods=["POST"])
+        def pre_index_project() -> dict[str, Any]:
+            try:
+                task = self._pre_index_project()
+                return {
+                    "status": "success",
+                    "message": "Pre-indexing has been scheduled. Open Logs to follow progress.",
+                    "task_id": id(task),
+                }
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+
         @self._app.route("/get_token_count_estimator_name", methods=["GET"])
         def get_token_count_estimator_name() -> dict[str, str]:
             estimator_name = self._tool_usage_stats.token_estimator_name if self._tool_usage_stats else "unknown"
@@ -406,6 +418,34 @@ class SerenaDashboardAPI:
     def _clear_tool_stats(self) -> None:
         if self._tool_usage_stats is not None:
             self._tool_usage_stats.clear()
+
+    def _pre_index_project(self) -> TaskExecutor.Task[None]:
+        from serena.indexing import index_project
+
+        if not self._agent.get_language_backend().is_lsp():
+            raise ValueError("Pre-indexing is only available when Serena uses the LSP backend.")
+
+        project = self._agent.get_active_project()
+        if project is None:
+            raise ValueError("No active project. Activate a project before pre-indexing.")
+
+        failed_log_file = os.path.join(project.project_root, ".serena", "logs", "indexing.txt")
+        parallel_request_log_file = os.path.join(project.project_root, ".serena", "logs", "indexing_requested_files.txt")
+
+        def run() -> None:
+            log.info("Dashboard requested pre-indexing for project '%s' at %s", project.project_name, project.project_root)
+            result = index_project(
+                project,
+                failed_log_file=failed_log_file,
+                parallel_request_log_file=parallel_request_log_file,
+                stop_language_servers=False,
+            )
+            if result.failed_files:
+                log.warning("Dashboard pre-indexing completed with %d failed file(s); see %s", len(result.failed_files), failed_log_file)
+            else:
+                log.info("Dashboard pre-indexing completed successfully for project '%s'", project.project_name)
+
+        return self._agent.issue_task(run, name="PreIndexProject", logged=True)
 
     def _get_config_overview(self) -> ResponseConfigOverview:
         from serena.config.context_mode import SerenaAgentContext, SerenaAgentMode

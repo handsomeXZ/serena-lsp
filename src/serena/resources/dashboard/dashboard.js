@@ -280,6 +280,7 @@ class Dashboard {
         this.$clearLogsBtn = $('#clear-logs-btn');
         this.$menuToggle = $('#menu-toggle');
         this.$menuDropdown = $('#menu-dropdown');
+        this.$menuPreIndex = $('#menu-pre-index');
         this.$menuShutdown = $('#menu-shutdown');
         this.$themeToggle = $('#theme-toggle');
         this.$themeIcon = $('#theme-icon');
@@ -352,6 +353,10 @@ class Dashboard {
         this.$menuShutdown.click(function (e) {
             e.preventDefault();
             self.shutdown();
+        });
+        this.$menuPreIndex.click(function (e) {
+            e.preventDefault();
+            self.preIndexProject();
         });
         this.$menuToggle.click(this.toggleMenu.bind(this));
         this.$themeToggle.click(this.toggleTheme.bind(this));
@@ -2240,6 +2245,34 @@ class Dashboard {
     }
 
     // ===== Shutdown Method =====
+
+    preIndexProject() {
+        const self = this;
+        this.$menuDropdown.hide();
+        this.$menuPreIndex.text('Scheduling pre-index...');
+
+        $.ajax({
+            url: '/pre_index_project',
+            type: 'POST',
+            contentType: 'application/json',
+            success: function (response) {
+                if (response.status === 'success') {
+                    self.navigateToPage('logs');
+                    self.$errorContainer.html('<div class="loading">Pre-indexing has been scheduled. Progress will appear in logs.</div>');
+                    self.loadQueuedExecutions();
+                } else {
+                    alert('Error scheduling pre-indexing: ' + response.message);
+                }
+            },
+            error: function (xhr, status, error) {
+                console.error('Error scheduling pre-indexing:', error);
+                alert('Error scheduling pre-indexing: ' + (xhr.responseJSON ? xhr.responseJSON.message : error));
+            },
+            complete: function () {
+                self.$menuPreIndex.text('Pre-index Project');
+            }
+        });
+    }
 
     shutdown() {
         const self = this;
