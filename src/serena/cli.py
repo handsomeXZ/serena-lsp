@@ -1,15 +1,10 @@
-import collections
-import concurrent.futures
 import glob
 import json
 import os
 import shutil
 import subprocess
 import sys
-import threading
-import time
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass, field
 from logging import Logger
 from pathlib import Path
 from typing import Any, Literal
@@ -18,7 +13,6 @@ import click
 from sensai.util import logging
 from sensai.util.logging import FileLoggerContext, datetime_tag
 from sensai.util.string import dict_string
-from tqdm import tqdm
 
 from serena.agent import SerenaAgent
 from serena.config.context_mode import SerenaAgentContext, SerenaAgentMode
@@ -37,12 +31,12 @@ from serena.constants import (
     SERENAS_OWN_CONTEXT_YAMLS_DIR,
     SERENAS_OWN_MODE_YAMLS_DIR,
 )
+from serena.indexing import IndexingResult, _clangd_index_max_workers, _index_language_parallel, _index_language_serial, index_project
 from serena.mcp import SerenaMCPFactory
 from serena.project import Project
 from serena.tools import FindReferencingSymbolsTool, FindSymbolTool, GetSymbolsOverviewTool, SearchForPatternTool, ToolRegistry
 from serena.util.dataclass import get_dataclass_default
 from serena.util.logging import MemoryLogHandler
-from solidlsp.language_servers.clangd_language_server import ClangdLanguageServer
 from solidlsp.ls_config import Language
 from solidlsp.ls_types import SymbolKind
 from solidlsp.util.subprocess_util import subprocess_kwargs
@@ -59,13 +53,6 @@ If no configuration changes were made, the base defaults are:
   {get_dataclass_default(SerenaConfig, "default_modes")}.
 Overriding them means that they no longer apply, so you will need to 
 re-specify them in addition to further modes if you want to keep them."""
-
-
-@dataclass
-class IndexingResult:
-    indexed_count: int = 0
-    failed_files: list[str] = field(default_factory=list)
-    exceptions: list[Exception] = field(default_factory=list)
 
 
 def find_project_root(root: str | Path | None = None) -> str | None:
@@ -593,15 +580,7 @@ class SerenaConfigCommands(AutoRegisteringGroup):
 class ProjectCommands(AutoRegisteringGroup):
     """Group for 'project' subcommands."""
 
-    _parallel_index_output_lock = threading.Lock()
     _PARALLEL_INDEX_REQUESTS_LOG = "indexing_requested_files.txt"
-
-    @staticmethod
-    def _append_parallel_index_request_log(log_file_path: str, log_line: str) -> None:
-        os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
-        with ProjectCommands._parallel_index_output_lock:
-            with open(log_file_path, "a", encoding="utf-8") as log_file:
-                log_file.write(f"{log_line}\n")
 
     def __init__(self) -> None:
         super().__init__(
@@ -609,75 +588,30 @@ class ProjectCommands(AutoRegisteringGroup):
         )
 
     @staticmethod
-    def _merge_indexing_result(target: IndexingResult, source: IndexingResult) -> None:
-        target.indexed_count += source.indexed_count
-        target.failed_files.extend(source.failed_files)
-        target.exceptions.extend(source.exceptions)
-
-    @staticmethod
     def _clangd_index_max_workers(ls: Any) -> int:
-        custom_settings = getattr(ls, "_custom_settings", None)
-        if custom_settings is not None and hasattr(custom_settings, "get"):
-            value = custom_settings.get("index_parallelism")
-            if isinstance(value, int):
-                return max(1, value)
-        return 1
+        return _clangd_index_max_workers(ls)
 
     @staticmethod
     def _index_language_serial(ls: Any, files: list[str]) -> IndexingResult:
-        result = IndexingResult()
-        for file_path in tqdm(files, desc=f"Indexing[{ls.language.value}]"):
-            try:
-                ls.request_document_symbols(file_path)
-                result.indexed_count += 1
-            except Exception as e:
-                log.error("Failed to index %s, continuing.", file_path, exc_info=e)
-                result.failed_files.append(file_path)
-                result.exceptions.append(e)
-        return result
+        return _index_language_serial(ls, files, use_tqdm=True, progress_callback=None)
 
     @staticmethod
-    def _index_language_parallel(ls: Any, files: list[str], max_workers: int, request_log_file_path: str | None = None) -> IndexingResult:
-        result = IndexingResult()
-
-        def work(file_path: str) -> tuple[str, Exception | None]:
-            try:
-                if request_log_file_path is not None:
-                    ProjectCommands._append_parallel_index_request_log(
-                        request_log_file_path, f"Requesting[{ls.language.value}] {file_path}"
-                    )
-                ls.request_document_symbols(file_path)
-                return file_path, None
-            except Exception as e:
-                return file_path, e
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"index-{ls.language.value}") as executor:
-            futures = {executor.submit(work, file_path): file_path for file_path in files}
-            completed_count = 0
-            total_count = len(files)
-            for future in tqdm(
-                concurrent.futures.as_completed(futures), total=len(futures), desc=f"Indexing[{ls.language.value}:parallel]"
-            ):
-                file_path, err = future.result()
-                completed_count += 1
-                if err is None:
-                    result.indexed_count += 1
-                    if request_log_file_path is not None:
-                        ProjectCommands._append_parallel_index_request_log(
-                            request_log_file_path,
-                            f"Indexed[{ls.language.value}] {completed_count}/{total_count} {file_path}",
-                        )
-                else:
-                    log.error("Failed to index %s, continuing.", file_path, exc_info=err)
-                    result.failed_files.append(file_path)
-                    result.exceptions.append(err)
-                    if request_log_file_path is not None:
-                        ProjectCommands._append_parallel_index_request_log(
-                            request_log_file_path,
-                            f"Failed[{ls.language.value}] {completed_count}/{total_count} {file_path}",
-                        )
-
-        return result
+    def _index_language_parallel(
+        ls: Any,
+        files: list[str],
+        max_workers: int,
+        request_log_file_path: str | None = None,
+        cache_save_interval_seconds: float = 30,
+    ) -> IndexingResult:
+        return _index_language_parallel(
+            ls,
+            files,
+            max_workers,
+            request_log_file_path=request_log_file_path,
+            use_tqdm=True,
+            progress_callback=None,
+            cache_save_interval_seconds=cache_save_interval_seconds,
+        )
 
     @staticmethod
     def _create_project(project_path: str, name: str | None, language: tuple[str, ...]) -> RegisteredProject:
@@ -789,60 +723,26 @@ class ProjectCommands(AutoRegisteringGroup):
         serena_config = SerenaConfig.from_config_file()
         proj = registered_project.get_project_instance(serena_config=serena_config)
         click.echo(f"Indexing symbols in {proj} …")
-        ls_mgr = proj.create_language_server_manager()
-        try:
-            log_file = os.path.join(proj.project_root, ".serena", "logs", "indexing.txt")
-            parallel_request_log_file: str | None = None
-            if lvl <= logging.INFO:
-                parallel_request_log_file = os.path.join(proj.project_root, ".serena", "logs", ProjectCommands._PARALLEL_INDEX_REQUESTS_LOG)
-                os.makedirs(os.path.dirname(parallel_request_log_file), exist_ok=True)
-                with open(parallel_request_log_file, "w", encoding="utf-8"):
-                    pass
+        log_file = os.path.join(proj.project_root, ".serena", "logs", "indexing.txt")
+        parallel_request_log_file: str | None = None
+        if lvl <= logging.INFO:
+            parallel_request_log_file = os.path.join(proj.project_root, ".serena", "logs", ProjectCommands._PARALLEL_INDEX_REQUESTS_LOG)
 
-            files = proj.gather_source_files()
+        result = index_project(
+            proj,
+            use_tqdm=True,
+            failed_log_file=log_file,
+            parallel_request_log_file=parallel_request_log_file,
+            stop_language_servers=True,
+            serial_indexer=ProjectCommands._index_language_serial,
+            parallel_indexer=ProjectCommands._index_language_parallel,
+            max_workers_provider=ProjectCommands._clangd_index_max_workers,
+        )
+        reported_language_file_counts = {k.value: v for k, v in result.language_file_counts.items()}
+        click.echo(f"Indexed files per language: {dict_string(reported_language_file_counts, brackets=None)}")
 
-            language_file_counts: dict[Language, int] = collections.defaultdict(lambda: 0)
-            files_by_ls_key: dict[int, tuple[Any, list[str]]] = {}
-            for file_path in files:
-                ls = ls_mgr.get_language_server(file_path)
-                ls_key = id(ls)
-                if ls_key not in files_by_ls_key:
-                    files_by_ls_key[ls_key] = (ls, [])
-                files_by_ls_key[ls_key][1].append(file_path)
-
-            aggregated_result = IndexingResult()
-            last_save_time = time.monotonic()
-
-            for ls, ls_files in files_by_ls_key.values():
-                max_workers = ProjectCommands._clangd_index_max_workers(ls)
-                if isinstance(ls, ClangdLanguageServer) and max_workers > 1:
-                    result = ProjectCommands._index_language_parallel(ls, ls_files, max_workers, parallel_request_log_file)
-                    language_file_counts[ls.language] += result.indexed_count
-                    ProjectCommands._merge_indexing_result(aggregated_result, result)
-                    ls.save_cache()
-                    continue
-
-                result = ProjectCommands._index_language_serial(ls, ls_files)
-                language_file_counts[ls.language] += result.indexed_count
-                ProjectCommands._merge_indexing_result(aggregated_result, result)
-                now = time.monotonic()
-                if now - last_save_time >= 30:
-                    ls_mgr.save_all_caches()
-                    last_save_time = now
-
-            reported_language_file_counts = {k.value: v for k, v in language_file_counts.items()}
-            click.echo(f"Indexed files per language: {dict_string(reported_language_file_counts, brackets=None)}")
-            ls_mgr.save_all_caches()
-
-            if len(aggregated_result.failed_files) > 0:
-                os.makedirs(os.path.dirname(log_file), exist_ok=True)
-                with open(log_file, "w") as f:
-                    for file, exception in zip(aggregated_result.failed_files, aggregated_result.exceptions, strict=True):
-                        f.write(f"{file}\n")
-                        f.write(f"{exception}\n")
-                click.echo(f"Failed to index {len(aggregated_result.failed_files)} files, see:\n{log_file}")
-        finally:
-            ls_mgr.stop_all()
+        if len(result.failed_files) > 0:
+            click.echo(f"Failed to index {len(result.failed_files)} files, see:\n{log_file}")
 
     @staticmethod
     @click.command(

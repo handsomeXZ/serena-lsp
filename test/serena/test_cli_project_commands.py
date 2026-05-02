@@ -262,7 +262,7 @@ class TestProjectIndex:
 
         calls: list[str] = []
 
-        def fake_parallel(ls, files, max_workers, request_log_file_path=None):
+        def fake_parallel(ls, files, max_workers, request_log_file_path=None, cache_save_interval_seconds=30):
             calls.append(f"parallel:{max_workers}")
             return SimpleNamespace(indexed_count=len(files), failed_files=[], exceptions=[])
 
@@ -296,7 +296,7 @@ class TestProjectIndex:
 
         calls: list[str] = []
 
-        def fake_parallel(ls, files, max_workers, request_log_file_path=None):
+        def fake_parallel(ls, files, max_workers, request_log_file_path=None, cache_save_interval_seconds=30):
             calls.append(f"parallel:{max_workers}")
             return SimpleNamespace(indexed_count=len(files), failed_files=[], exceptions=[])
 
@@ -400,6 +400,33 @@ class TestProjectIndex:
         assert any(" 2/2 " in line for line in indexed_lines)
         assert any(line.endswith(" a.cpp") for line in indexed_lines)
         assert any(line.endswith(" b.cpp") for line in indexed_lines)
+
+    def test_index_language_parallel_saves_cache_during_long_runs(self):
+        files = ["a.cpp", "b.cpp", "c.cpp"]
+        requested_files: list[str] = []
+        save_points: list[int] = []
+        ls = SimpleNamespace(language=Language.CPP)
+
+        def request_document_symbols(file_path: str) -> None:
+            requested_files.append(file_path)
+
+        def save_cache() -> None:
+            save_points.append(len(requested_files))
+
+        ls.request_document_symbols = request_document_symbols
+        ls.save_cache = save_cache
+
+        result = ProjectCommands._index_language_parallel(
+            ls,
+            files,
+            max_workers=1,
+            request_log_file_path=None,
+            cache_save_interval_seconds=0,
+        )
+
+        assert result.indexed_count == len(files)
+        assert save_points
+        assert min(save_points) < len(files)
 
 
 class DummySolidLanguageServer(SolidLanguageServer):
