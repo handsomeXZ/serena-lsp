@@ -218,6 +218,15 @@ tmp/
 # Claude settings
 .claude/settings.local.json
 
+# Local agent/tooling artifacts
+/.playwright-mcp/
+/.sisyphus/
+/node_modules/
+/package.json
+/package-lock.json
+/bun.lock
+/task-*-e2e-dashboard.png
+
 # Elixir
 /test/resources/repos/elixir/test_repo/deps
 # Exception: Don't ignore Elixir test repository lib directory (contains source code)
