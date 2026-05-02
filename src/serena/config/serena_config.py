@@ -168,8 +168,20 @@ class NamedToolInclusionDefinition(ToolInclusionDefinition):
 
 @dataclass
 class ModeSelectionDefinition:
-    base_modes: Sequence[str] | None = None
     default_modes: Sequence[str] | None = None
+
+
+@dataclass
+class ModeSelectionDefinitionWithBaseModes(ModeSelectionDefinition):
+    base_modes: Sequence[str] | None = ("interactive", "editing")
+    """
+    the base modes to use, which are always guaranteed to be included
+    """
+
+
+@dataclass
+class ModeSelectionDefinitionWithAddedModes(ModeSelectionDefinition):
+    added_modes: Sequence[str] | None = None
 
 
 class LanguageBackend(Enum):
@@ -228,7 +240,7 @@ class LineEnding(Enum):
 
 
 @dataclass
-class SharedConfig(ModeSelectionDefinition, ToolInclusionDefinition, ToStringMixin):
+class SharedConfig(ToolInclusionDefinition, ToStringMixin):
     """Shared between SerenaConfig and ProjectConfig, the latter used to override values in the form
     (same as in ModeSelectionDefinition).
     The defaults here shall be none and should be set to the global default values in SerenaConfig.
@@ -255,7 +267,7 @@ Uses $projectDir and $projectFolderName as placeholders.
 
 
 @dataclass(kw_only=True)
-class ProjectConfig(SharedConfig):
+class ProjectConfig(SharedConfig, ModeSelectionDefinitionWithAddedModes):
     project_name: str
     languages: list[Language]
     ignored_paths: list[str] = field(default_factory=list)
@@ -418,6 +430,10 @@ class ProjectConfig(SharedConfig):
             data["languages"] = [data["language"]]
             del data["language"]
 
+        # Note: Checks for validity of fields must not happen here but in _from_dict.
+        # Here, the data may be incomplete, because this function is also used for
+        # loading project.local.yml files.
+
         return data, was_complete
 
     @classmethod
@@ -461,13 +477,22 @@ class ProjectConfig(SharedConfig):
         line_ending_value = data.get("line_ending")
         line_ending = LineEnding.from_str(line_ending_value) if line_ending_value else None
 
+        # gracefully handle user errors: incorrect use of None/empty where a list is required
+        ignored_paths = data["ignored_paths"] or []
+        fixed_tools = data["fixed_tools"] or []
+        excluded_tools = data["excluded_tools"] or []
+        included_optional_tools = data["included_optional_tools"] or []
+
+        if "base_modes" in data and data["base_modes"] is not None:
+            log.warning("The base_modes setting in project.yml is deprecated and will be ignored.")
+
         return cls(
             project_name=data["project_name"],
             languages=languages,
-            ignored_paths=data["ignored_paths"],
-            excluded_tools=data["excluded_tools"],
-            fixed_tools=data["fixed_tools"],
-            included_optional_tools=data["included_optional_tools"],
+            ignored_paths=ignored_paths,
+            excluded_tools=excluded_tools,
+            fixed_tools=fixed_tools,
+            included_optional_tools=included_optional_tools,
             read_only=data["read_only"],
             read_only_memory_patterns=data.get("read_only_memory_patterns", []),
             ignored_memory_patterns=data.get("ignored_memory_patterns", []),
@@ -476,7 +501,7 @@ class ProjectConfig(SharedConfig):
             encoding=data["encoding"],
             line_ending=line_ending,
             language_backend=language_backend,
-            base_modes=data["base_modes"],
+            added_modes=data["added_modes"],
             default_modes=data["default_modes"],
             symbol_info_budget=symbol_info_budget,
             ls_specific_settings=data.get("ls_specific_settings", {}),
@@ -667,7 +692,7 @@ class RegisteredProject(ToStringMixin):
 
 
 @dataclass(kw_only=True)
-class SerenaConfig(SharedConfig):
+class SerenaConfig(SharedConfig, ModeSelectionDefinitionWithBaseModes):
     """
     Holds the Serena agent configuration, which is typically loaded from a YAML configuration file
     (when instantiated via :method:`from_config_file`), which is updated when projects are added or removed.
@@ -682,6 +707,7 @@ class SerenaConfig(SharedConfig):
     trace_lsp_communication: bool = False
     web_dashboard: bool = True
     web_dashboard_open_on_launch: bool = True
+    web_dashboard_interface: str | None = None
     web_dashboard_listen_address: str = "127.0.0.1"
     jetbrains_plugin_server_address: str = "127.0.0.1"
     tool_timeout: float = DEFAULT_TOOL_TIMEOUT
@@ -720,7 +746,6 @@ class SerenaConfig(SharedConfig):
     """
     the language backend to use for code understanding features
     """
-    default_modes: Sequence[str] | None = ("interactive", "editing")
     line_ending: LineEnding = LineEnding.NATIVE
     symbol_info_budget: float = 10.0
     """
@@ -858,7 +883,18 @@ class SerenaConfig(SharedConfig):
                 if path is None:
                     continue
                 num_migrations += 1
-            project_config = ProjectConfig.load(path, serena_config=instance)  # instance is sufficiently populated
+            try:
+                project_config = ProjectConfig.load(path, serena_config=instance)  # instance is sufficiently populated
+            except Exception as e:
+                log.error(
+                    "Failed to load project configuration for %s: %s. "
+                    "This project will be skipped. Fix or delete its "
+                    ".serena/project.yml (or remove it from "
+                    "serena_config.yml) to re-enable it.",
+                    path,
+                    e,
+                )
+                continue
             project = RegisteredProject(
                 project_root=str(path),
                 project_config=project_config,
