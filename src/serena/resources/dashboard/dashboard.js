@@ -490,32 +490,9 @@ class Dashboard {
 
         // Initialize the application
         this.loadToolNames().then(function () {
-            // Start on overview page
             self.loadNews();
-            self.loadConfigOverview();
-            self.startConfigPolling();
-            self.startExecutionsPolling();
-        });
-        // Initialize heartbeat interval
-        setInterval(this.heartbeat.bind(this), 250);
-    }
-
-    heartbeat() {
-        let self = this;
-        $.ajax({
-            url: '/heartbeat',
-            type: 'GET',
-            success: function (response) {
-                self.heartbeatFailureCount = 0;
-            },
-            error: function (xhr, status, error) {
-                self.heartbeatFailureCount++;
-                console.error('Heartbeat failure; count = ', self.heartbeatFailureCount);
-                if (self.heartbeatFailureCount >= 1) {
-                    console.log('Server appears to be down, closing tab');
-                    window.close();
-                }
-            },
+            // start on overview page
+            self.navigateToPage("overview");
         });
     }
 
@@ -546,7 +523,6 @@ class Dashboard {
         // Start appropriate polling for the page
         if (page === 'overview') {
             this.loadNews();
-            this.loadConfigOverview();
             this.startConfigPolling();
             this.startExecutionsPolling();
         } else if (page === 'logs') {
@@ -604,7 +580,8 @@ class Dashboard {
                 } else {
                     console.log('Config unchanged, skipping display update');
                 }
-            }, error: function (xhr, status, error) {
+            },
+            error: function (xhr, status, error) {
                 console.error('Error loading config overview:', error);
                 self.$configDisplay.html('<div class="error-message">Error loading configuration</div>');
                 self.$basicStatsDisplay.html('<div class="error-message">Error loading stats</div>');
@@ -612,24 +589,23 @@ class Dashboard {
                 self.$availableToolsDisplay.html('<div class="error-message">Error loading tools</div>');
                 self.$availableModesDisplay.html('<div class="error-message">Error loading modes</div>');
                 self.$availableContextsDisplay.html('<div class="error-message">Error loading contexts</div>');
-            }, complete: function () {
+            },
+            complete: function () {
                 self.waitingForConfigPollingResult = false;
             }
         });
     }
 
     startConfigPolling() {
+        this.loadConfigOverview();
         this.configPollInterval = setInterval(this.loadConfigOverview.bind(this), 1000);
     }
 
     startExecutionsPolling() {
+        this.loadExecutions()
         // Poll every 1 second for executions (independent of config polling)
         // This ensures stuck executions can still be cancelled even if config polling is blocked
-        this.loadExecutions()
-        this.executionsPollInterval = setInterval(() => {
-            this.loadQueuedExecutions();
-            this.loadLastExecution();
-        }, 1000);
+        this.executionsPollInterval = setInterval(this.loadExecutions.bind(this), 1000);
     }
 
     displayConfig(config) {
@@ -641,6 +617,8 @@ class Dashboard {
             const wasMemoriesExpanded = $existingMemoriesContent.is(':visible');
 
             let html = '<div class="config-grid">';
+
+            html += '<div class="config-label">Version:</div><div class="config-value">' + config.serena_version + '</div>';
 
             // Project info
             html += '<div class="config-label">Active Project:</div>';
@@ -706,10 +684,6 @@ class Dashboard {
             // File Encoding info
             html += '<div class="config-label">File Encoding:</div>';
             html += '<div class="config-value">' + (config.encoding || 'N/A') + '</div>';
-
-            // Current Client info
-            html += '<div class="config-label">Current Client:</div>';
-            html += '<div class="config-value">' + (config.current_client || 'None') + '</div>';
 
             html += '</div>';
 
@@ -912,26 +886,30 @@ class Dashboard {
 
     // ===== Executions Methods =====
 
-    loadQueuedExecutions() {
+    loadQueuedExecutions(onComplete) {
         let self = this;
         $.ajax({
-            url: '/queued_task_executions', type: 'GET', success: function (response) {
+            url: '/queued_task_executions', type: 'GET',
+            success: function (response) {
                 if (response.status === 'success') {
                     self.displayActiveExecutionsQueue(response.queued_executions || []);
                 } else {
                     console.error('Error loading executions:', response.message);
                 }
-            }, error: function (xhr, status, error) {
+            },
+            error: function (xhr, status, error) {
                 console.error('Error loading executions:', error);
                 self.$activeExecutionQueueDisplay.html('<div class="error-message">Error loading executions</div>');
-            }
+            },
+            complete: onComplete
         });
     }
 
-    loadLastExecution() {
+    loadLastExecution(onComplete) {
         let self = this;
         $.ajax({
-            url: '/last_execution', type: 'GET', success: function (response) {
+            url: '/last_execution', type: 'GET',
+            success: function (response) {
                 if (response.status === 'success') {
                     if (response.last_execution !== null && response.last_execution.logged) {
                         self.displayLastExecution(response.last_execution);
@@ -939,21 +917,28 @@ class Dashboard {
                 } else {
                     console.error('Error loading last execution:', response.message);
                 }
-            }, error: function (xhr, status, error) {
+            },
+            error: function (xhr, status, error) {
                 console.error('Error loading last execution:', error);
                 self.$lastExecutionDisplay.html('<div class="error-message">Error loading last execution</div>');
-            }
+            },
+            complete: onComplete
         });
     }
 
     loadExecutions() {
+        const self = this;
         if (this.waitingForExecutionsPollingResult) {
             console.log('Still waiting for previous executions poll result, skipping this poll');
-        } else {
+        }
+        else {
             this.waitingForExecutionsPollingResult = true;
             console.log('Polling for executions...');
-            this.loadQueuedExecutions();
-            this.loadLastExecution();
+            this.loadQueuedExecutions(function() {
+                self.loadLastExecution(function() {
+                    self.waitingForExecutionsPollingResult = false;
+                });
+            });
         }
     }
 
@@ -2078,31 +2063,36 @@ class Dashboard {
         let self = this;
         console.log('Loading news...');
         $.ajax({
-            url: '/news_snippet_ids',
+            url: '/fetch_unread_news',
             type: 'GET',
             success: function(response) {
-                console.log('News snippet IDs response:', response);
-                if (response.status === 'success' && response.news_snippet_ids && response.news_snippet_ids.length > 0) {
-                    console.log('Displaying news with IDs:', response.news_snippet_ids);
-                    self.displayNews(response.news_snippet_ids);
+                console.log('Unread news response:', response);
+                if (response.status === 'success' && response.news && Object.keys(response.news).length > 0) {
+                    const newsIds = Object.keys(response.news);
+                    self.displayNews(newsIds, response.news);
                 } else {
                     console.log('No unread news, hiding section');
                     self.$newsSection.hide();
                 }
             },
             error: function(xhr, status, error) {
-                console.error('Error loading news snippet IDs:', error);
+                console.error('Error loading news:', error);
                 self.$newsSection.hide();
             }
         });
     }
 
-    displayNews(newsIds) {
+    /**
+     * Display news items given unread IDs and the full news data mapping.
+     * @param {number[]} newsIds - array of unread news IDs
+     * @param {Object} newsData - mapping of news ID strings to HTML content
+     */
+    displayNews(newsIds, newsData) {
         let self = this;
         console.log('displayNews called with:', newsIds);
         // Sort newest first (descending order)
         newsIds.sort((a, b) => b - a);
-        
+
         if (newsIds.length === 0) {
             console.log('No news items to display.');
             self.$newsSection.hide();
@@ -2111,40 +2101,32 @@ class Dashboard {
         self.$newsSection.show();
         self.$newsDisplay.empty();
         console.log('Displaying ' + newsIds.length + ' news items.');
-        // Load each news snippet HTML
-        let loadedCount = 0;
-        newsIds.forEach(function(newsId) {
-            $.ajax({
-                url: '/dashboard/news/' + newsId + '.html',
-                type: 'GET',
-                success: function(html) {
-                    // Wrap the HTML in a container with a button
-                    let $newsContainer = $('<div class="news-container">').attr('data-news-id', newsId);
-                    let $newsContent = $(html);
-                    
-                    // Add button for marking as read
-                    let $markRead = $('<div class="news-mark-read">');
-                    let $button = $('<button class="news-mark-read-btn">').attr('data-news-id', newsId).text('Mark as read');
 
-                    $markRead.append($button);
-                    $newsContent.append($markRead);
-                    
-                    $newsContainer.append($newsContent);
-                    self.$newsDisplay.append($newsContainer);
-                    
-                    // Bind button click event
-                    $button.on('click', function() {
-                        const btn = $(this);
-                        btn.prop('disabled', true).text('Marking...');
-                        self.markNewsAsRead(newsId);
-                    });
-                    
-                    loadedCount++;
-                },
-                error: function(xhr, status, error) {
-                    console.error('Error loading news snippet ' + newsId + ':', error);
-                    loadedCount++;
-                }
+        newsIds.forEach(function(newsId) {
+            const html = newsData[String(newsId)];
+            if (!html) {
+                console.warn('No news content found for ID ' + newsId);
+                return;
+            }
+            // Wrap the HTML in a container with a button
+            let $newsContainer = $('<div class="news-container">').attr('data-news-id', newsId);
+            let $newsContent = $(html);
+
+            // Add button for marking as read
+            let $markRead = $('<div class="news-mark-read">');
+            let $button = $('<button class="news-mark-read-btn">').attr('data-news-id', newsId).text('Mark as read');
+
+            $markRead.append($button);
+            $newsContent.append($markRead);
+
+            $newsContainer.append($newsContent);
+            self.$newsDisplay.append($newsContainer);
+
+            // Bind button click event
+            $button.on('click', function() {
+                const btn = $(this);
+                btn.prop('disabled', true).text('Marking...');
+                self.markNewsAsRead(newsId);
             });
         });
     }

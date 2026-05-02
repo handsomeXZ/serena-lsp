@@ -11,6 +11,9 @@ import pytest
 
 from solidlsp import SolidLanguageServer
 from solidlsp.ls_config import Language
+from solidlsp.ls_types import SymbolKind
+from test.solidlsp.conftest import format_symbol_for_assert, has_malformed_name, request_all_symbols
+from test.solidlsp.util.diagnostics import assert_file_diagnostics
 
 from . import EXPERT_UNAVAILABLE, EXPERT_UNAVAILABLE_REASON
 
@@ -110,3 +113,38 @@ class TestElixirBasic:
         for _ in range(3):
             symbols = language_server.request_document_symbols("lib/services.ex").get_all_symbols_and_roots()
             assert symbols is not None
+
+    @pytest.mark.parametrize("language_server", [Language.ELIXIR], indirect=True)
+    def test_bare_symbol_names(self, language_server) -> None:
+        all_symbols = request_all_symbols(language_server)
+        malformed_symbols = []
+        for s in all_symbols:
+            if s["kind"] in {SymbolKind.Module, SymbolKind.Namespace, SymbolKind.Struct}:
+                continue
+
+            allow_test_style_name = s["name"].startswith(('test "', 'describe "'))
+            allow_struct_name = s["name"].startswith("%")
+            allow_type_name = s["name"].startswith("@type ")
+            if has_malformed_name(
+                s,
+                whitespace_allowed=allow_test_style_name or allow_type_name,
+                period_allowed=allow_struct_name,
+                colon_allowed=allow_test_style_name,
+                brace_allowed=allow_test_style_name or allow_struct_name,
+                comma_allowed=allow_test_style_name,
+            ):
+                malformed_symbols.append(s)
+        if malformed_symbols:
+            pytest.fail(
+                f"Found malformed symbols: {[format_symbol_for_assert(sym) for sym in malformed_symbols]}",
+                pytrace=False,
+            )
+
+    @pytest.mark.parametrize("language_server", [Language.ELIXIR], indirect=True)
+    def test_file_diagnostics(self, language_server: SolidLanguageServer) -> None:
+        assert_file_diagnostics(
+            language_server,
+            "lib/diagnostics_sample.ex",
+            (),
+            min_count=1,
+        )

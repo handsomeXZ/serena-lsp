@@ -1,19 +1,32 @@
+import json
+import multiprocessing
 import os
 import socket
+import subprocess
+import sys
 import threading
+import time
+import urllib.error
+import urllib.request
 from collections.abc import Callable
+from dataclasses import dataclass
+from html import escape
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, Optional, Self
 
+import psutil
 from flask import Flask, Response, redirect, request, send_from_directory
+from PIL import Image
 from pydantic import BaseModel
 from sensai.util import logging
+from sensai.util.pickle import dump_pickle, load_pickle
 
 from serena.analytics import ToolUsageStats
 from serena.config.serena_config import SerenaConfig, SerenaPaths
-from serena.constants import SERENA_DASHBOARD_DIR
+from serena.constants import SERENA_DASHBOARD_DIR, SerenaPorts
 from serena.task_executor import TaskExecutor
 from serena.util.logging import MemoryLogHandler
+from serena.util.pywebview import WebViewWithTray
 
 if TYPE_CHECKING:
     from serena.agent import SerenaAgent
@@ -57,6 +70,7 @@ class ResponseConfigOverview(BaseModel):
     languages: list[str]
     encoding: str | None
     current_client: str | None
+    serena_version: str
 
 
 class ResponseAvailableLanguages(BaseModel):
@@ -124,7 +138,57 @@ class QueuedExecution(BaseModel):
         )
 
 
+class ReadNews:
+    def __init__(self, read_ids: list[str], legacy_last_read_id: str | None = None):
+        self._read_ids = set(read_ids)
+        self._legacy_last_read_id = legacy_last_read_id
+
+    @staticmethod
+    def load() -> "ReadNews":
+        read_news_path = SerenaPaths().news_read_items_file
+        legacy_last_read_id_path = SerenaPaths().news_legacy_last_read_id_file
+
+        def load_legacy_last_read_id() -> str | None:
+            if not os.path.exists(legacy_last_read_id_path):
+                return None
+            with open(legacy_last_read_id_path, encoding="utf-8") as f:
+                last_read_news_id = f.read().strip()
+                if last_read_news_id == "20262103":
+                    last_read_news_id = "20260321"  # fix originally misnamed news id
+                return last_read_news_id
+
+        if os.path.exists(read_news_path):
+            return load_pickle(read_news_path)
+        else:
+            instance = ReadNews(read_ids=[], legacy_last_read_id=load_legacy_last_read_id())
+            instance._save()
+            try:
+                os.unlink(legacy_last_read_id_path)
+            except:
+                pass
+            return instance
+
+    def _save(self) -> None:
+        dump_pickle(self, SerenaPaths().news_read_items_file)
+
+    def is_read(self, identifier: str) -> bool:
+        if identifier in self._read_ids:
+            return True
+        if self._legacy_last_read_id is not None and identifier <= self._legacy_last_read_id:
+            return True
+        return False
+
+    def mark_read(self, identifier: str) -> None:
+        """
+        Marks the given news snippet as read, saving the new state to disk
+        """
+        self._read_ids.add(identifier)
+        self._save()
+
+
 class SerenaDashboardAPI:
+    BASE_PORT = SerenaPorts.DASHBOARD_API_BASE_PORT
+
     log = logging.getLogger(__qualname__)
 
     def __init__(
@@ -132,16 +196,19 @@ class SerenaDashboardAPI:
         memory_log_handler: MemoryLogHandler,
         tool_names: list[str],
         agent: "SerenaAgent",
-        shutdown_callback: Callable[[], None] | None = None,
         tool_usage_stats: ToolUsageStats | None = None,
     ) -> None:
         self._memory_log_handler = memory_log_handler
         self._tool_names = tool_names
         self._agent = agent
-        self._shutdown_callback = shutdown_callback
         self._app = Flask(__name__)
         self._tool_usage_stats = tool_usage_stats
+        self._loaded_news: dict[str, str] = {}
+        self._news_ready = threading.Event()
         self._setup_routes()
+        self._read_news = ReadNews.load()
+        # Fetch remote news in background on startup (non-blocking)
+        threading.Thread(target=self._fetch_news, daemon=True).start()
 
     @property
     def memory_log_handler(self) -> MemoryLogHandler:
@@ -222,7 +289,7 @@ class SerenaDashboardAPI:
 
         @self._app.route("/shutdown", methods=["PUT"])
         def shutdown() -> dict[str, str]:
-            self._shutdown()
+            self._agent.shutdown()
             return {"status": "shutting down"}
 
         @self._app.route("/get_available_languages", methods=["GET"])
@@ -343,7 +410,7 @@ class SerenaDashboardAPI:
                 return {
                     "status": "success",
                     "was_cancelled": False,
-                    "message": f"Task with id {request_data.get('task_id')} not found, maybe execution was already finished",
+                    "message": f"Task with id {escape(request_data.get('task_id'))} not found, maybe execution was already finished",
                 }
             except Exception as e:
                 return {"status": "error", "message": str(e), "was_cancelled": False}
@@ -357,34 +424,30 @@ class SerenaDashboardAPI:
             except Exception as e:
                 return {"status": "error", "message": str(e)}
 
-        @self._app.route("/news_snippet_ids", methods=["GET"])
-        def get_news_snippet_ids() -> dict[str, str | list[int]]:
-            def _get_unread_news_ids() -> list[int]:
-                all_news_files = (Path(SERENA_DASHBOARD_DIR) / "news").glob("*.html")
-                all_news_ids = [int(f.stem) for f in all_news_files]
-                """News ids are ints of format YYYYMMDD (publication dates)"""
+        @self._app.route("/fetch_unread_news", methods=["GET"])
+        def fetch_unread_news() -> dict[str, dict[str, str] | str]:
+            def _fetch_unread_news() -> dict[str, str]:
+                """News ids are strings of format YYYYMMDD (publication dates)"""
+                self._news_ready.wait()
+                all_news = self._loaded_news
 
-                # Filter news items by installation date
                 serena_config_creation_date = SerenaConfig.get_config_file_creation_date()
                 if serena_config_creation_date is None:
                     # should not normally happen, since config file should exist when the dashboard is started
                     # We assume a fresh installation in this case
                     log.error("Serena config file not found when starting the dashboard")
-                    return []
-                serena_config_creation_date_int = int(serena_config_creation_date.strftime("%Y%m%d"))
-                # Only include news items published on or after the installation date
-                post_installation_news_ids = [news_id for news_id in all_news_ids if news_id >= serena_config_creation_date_int]
+                    return {}
+                serena_config_creation_date = serena_config_creation_date.strftime("%Y%m%d")
 
-                news_snippet_id_file = SerenaPaths().news_snippet_id_file
-                if not os.path.exists(news_snippet_id_file):
-                    return post_installation_news_ids
-                with open(news_snippet_id_file, encoding="utf-8") as f:
-                    last_read_news_id = int(f.read().strip())
-                return [news_id for news_id in post_installation_news_ids if news_id > last_read_news_id]
+                # filter for news after the installation date
+                post_installation_news = {k: v for k, v in all_news.items() if k >= serena_config_creation_date}
+
+                # read unread news
+                return {k: v for k, v in post_installation_news.items() if not self._read_news.is_read(k)}
 
             try:
-                unread_news_ids = _get_unread_news_ids()
-                return {"news_snippet_ids": unread_news_ids, "status": "success"}
+                unread_news = _fetch_unread_news()
+                return {"news": unread_news, "status": "success"}
             except Exception as e:
                 return {"status": "error", "message": str(e)}
 
@@ -392,10 +455,8 @@ class SerenaDashboardAPI:
         def mark_news_snippet_as_read() -> dict[str, str]:
             try:
                 request_data = request.get_json()
-                news_snippet_id = int(request_data.get("news_snippet_id"))
-                news_snippet_id_file = SerenaPaths().news_snippet_id_file
-                with open(news_snippet_id_file, "w", encoding="utf-8") as f:
-                    f.write(str(news_snippet_id))
+                news_snippet_id = escape(str(request_data.get("news_snippet_id")))
+                self._read_news.mark_read(news_snippet_id)
                 return {"status": "success", "message": f"Marked news snippet {news_snippet_id} as read"}
             except Exception as e:
                 return {"status": "error", "message": str(e)}
@@ -572,16 +633,8 @@ class SerenaDashboardAPI:
             languages=languages,
             encoding=encoding,
             current_client=Tool.get_last_tool_call_client_str(),
+            serena_version=self._agent.version,
         )
-
-    def _shutdown(self) -> None:
-        log.info("Shutting down Serena")
-        if self._shutdown_callback:
-            self._shutdown_callback()
-        else:
-            # noinspection PyProtectedMember
-            # noinspection PyUnresolvedReferences
-            os._exit(0)
 
     def _get_available_languages(self) -> ResponseAvailableLanguages:
         from solidlsp.ls_config import Language
@@ -663,6 +716,66 @@ class SerenaDashboardAPI:
 
         self._agent.execute_task(run, logged=True, name="SaveSerenaConfig")
 
+    # ===== Remote News Methods =====
+
+    # The branch from which news are fetched. Change to a feature branch for testing.
+    _NEWS_JSON_URL = "https://oraios-software.de/serena_news.json"
+
+    def _fetch_news(self) -> None:
+        """Fetch news.json from GitHub using ETag-based caching and store in memory. Silently ignores network errors."""
+        paths = SerenaPaths()
+
+        headers: dict[str, str] = {}
+        # Load stored ETag if available
+        if os.path.exists(paths.news_etag_file) and os.path.exists(paths.news_file):
+            try:
+                with open(paths.news_etag_file, encoding="utf-8") as f:
+                    stored_etag = f.read().strip()
+                if stored_etag:
+                    headers["If-None-Match"] = stored_etag
+            except Exception:
+                log.warning("Failed to read stored news ETag at %s, proceeding without it", paths.news_etag_file, exc_info=True)
+
+        fetched_news_dict = None
+        try:
+            req = urllib.request.Request(self._NEWS_JSON_URL, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as response:
+                etag = response.headers.get("ETag", "")
+                body = response.read().decode("utf-8")
+                # Validate JSON
+                fetched_news_dict = json.loads(body)
+                # Store news content and ETag
+                with open(paths.news_file, "w", encoding="utf-8") as f:
+                    f.write(body)
+                if etag:
+                    with open(paths.news_etag_file, "w", encoding="utf-8") as f:
+                        f.write(etag)
+                log.info("Remote news updated from %s", self._NEWS_JSON_URL)
+        except urllib.error.HTTPError as e:
+            if e.code == 304:
+                log.debug("Remote news unchanged (304 Not Modified)")
+            else:
+                log.warning("Failed to fetch remote news (HTTP %d): %s", e.code, e.reason)
+        except Exception as e:
+            log.warning("Failed to fetch remote news: %s", e)
+        if fetched_news_dict is None:
+            fetched_news_dict = self._load_previously_fetched_news_data()
+        self._loaded_news = fetched_news_dict
+        self._news_ready.set()
+
+    @staticmethod
+    def _load_previously_fetched_news_data() -> dict[str, str]:
+        """Return the news data dict. Uses local cache if available, otherwise falls back to local news files."""
+        paths = SerenaPaths()
+
+        if os.path.exists(paths.news_file):
+            try:
+                with open(paths.news_file, encoding="utf-8") as f:
+                    return json.loads(f.read())
+            except Exception:
+                log.warning("Failed to read cached news data from %s", paths.news_file)
+        return {}
+
     def _add_language(self, request_add_language: RequestAddLanguage) -> None:
         from solidlsp.ls_config import Language
 
@@ -709,8 +822,513 @@ class SerenaDashboardAPI:
         return port
 
     def run_in_thread(self, host: str) -> tuple[threading.Thread, int]:
-        port = self._find_first_free_port(0x5EDA, host)
+        port = self._find_first_free_port(self.BASE_PORT, host)
         log.info("Starting dashboard (listen_address=%s, port=%d)", host, port)
         thread = threading.Thread(target=lambda: self.run(host=host, port=port), daemon=True)
         thread.start()
         return thread, port
+
+
+def open_url_in_browser(url: str, use_subprocess: bool = False) -> None:
+    """
+    Opens the given URL in the user's default web browser,
+    optionally using a subprocess to ensure that no output is written to stdout
+    (highly problematic when run within a stdio MCP server context)
+
+    :param url: the URL to open
+    :param use_subprocess: whether to use a subprocess to opening the URL, making stdio contamination impossible
+    """
+    if use_subprocess:
+        # Use a subprocess to avoid any output from webbrowser.open being written to stdout
+        try:
+            subprocess.Popen(
+                [sys.executable, "-c", f"import webbrowser; webbrowser.open({url!r})"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=False,
+            )
+        except Exception as e:
+            # Subprocess creation can fail in rare cases (e.g. on some Linux systems; possibly subprocess/glibc bug)
+            # See #1363
+            log.error("Failed to open URL (%s) in subprocess; %s", url, e)
+    else:
+        import webbrowser
+
+        webbrowser.open(url)
+
+
+class SerenaDashboardViewer(WebViewWithTray):
+    """
+    Minimal pywebview wrapper that opens a dashboard in a native window with optional system tray.
+    """
+
+    DEBUG = False
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        width: int = 1400,
+        height: int = 900,
+        start_minimized: bool = False,
+        parent_process_id: int | None = None,
+        tray: bool = True,
+    ):
+        """
+        :param url: the URL to open
+        :param width: the width of the window
+        :param height: the height of the window
+        :param start_minimized: whether to start the window minimized (to the tray if tray is enabled)
+        :param parent_process_id: the process ID of the parent Serena agent process, which is monitored for termination,
+            automatically closing the dashboard when the parent process dies
+        :param tray: whether to use a system tray icon (which the app minimizes to when the window is closed)
+        """
+        dashboard_path = Path(SERENA_DASHBOARD_DIR)
+
+        # .ico is Windows-only; macOS expects a PNG for the window/dock icon.
+        app_icon_filename = "serena.ico" if sys.platform == "win32" else "serena-icon-1024-mac.png"
+        app_icon_path = str(dashboard_path / app_icon_filename)
+
+        tray_icon_filename = "serena-icon-tray-mac.png" if sys.platform == "darwin" else "serena-icon-48.png"
+        tray_icon_path = str(dashboard_path / tray_icon_filename)
+
+        super().__init__(
+            url,
+            title="Serena Dashboard",
+            tray=tray,
+            width=width,
+            height=height,
+            start_minimized=start_minimized,
+            parent_process_id=parent_process_id,
+            app_id="oraios.serena",
+            app_icon_path=app_icon_path,
+            tray_icon_path=tray_icon_path,
+        )
+
+    @staticmethod
+    def is_current_platform_supported() -> bool:
+        """
+        :return: whether the current platform supports the native dashboard viewer (and tray manager).
+        """
+        # supported on Windows and macOS; Linux support is problematic
+        # (see https://github.com/oraios/serena/pull/1117#issuecomment-4128753943)
+        supported_platforms = [
+            "win32",
+            "darwin",
+        ]
+        return sys.platform in supported_platforms
+
+    def run(self) -> None:
+        if self.DEBUG:
+            logging.configure(level=logging.DEBUG, stream=sys.stderr)
+            logging.add_file_logger(SerenaPaths().get_next_log_file_path("dashboard-viewer"))
+
+        super().run()
+
+
+@dataclass
+class TrayManagedInstance:
+    """A registered Serena dashboard instance managed by the tray manager."""
+
+    port: int
+    """the port on which the dashboard API is listening"""
+
+    parent_process: psutil.Process
+    """the process of the Serena agent owning this dashboard instance"""
+
+    dashboard_url: str
+    """the full URL to the dashboard frontend"""
+
+    project: str | None
+    """the name of the active project, or None if no project is activated"""
+
+    started_at: str
+    """ISO 8601 timestamp of when the agent instance was started"""
+
+
+class SerenaDashboardTrayManager:
+    """
+    Singleton process managing a system tray icon for all Serena dashboard instances.
+
+    Runs a Flask backend on a fixed port and displays a single tray icon that
+    aggregates all running Serena instances. Individual dashboard viewers are
+    spawned on demand when the user clicks a menu item.
+
+    The manager is started as a detached process by the first Serena agent that
+    needs it and terminates automatically when no dashboard instances remain.
+    """
+
+    DEBUG = False
+
+    PORT = SerenaPorts.TRAY_MANAGER_PORT
+
+    HOST = "127.0.0.1"
+    """listen address (local only)"""
+
+    ALIVE_CHECK_INTERVAL_SECONDS = 3
+    """interval in seconds between alive checks of registered instances"""
+
+    def __init__(self, use_pywebview: bool = False, alive_check_use_pid: bool = True) -> None:
+        """
+        :param use_pywebview: whether to use pywebview-based viewer applications (separate child processes)
+            for opening dashboards; if False, open them directly in the user's default web browser.
+        :param alive_check_use_pid: whether to use the process ID for alive checks of registered instances.
+            If True, the manager will check whether the process with the registered PID is still running.
+            If False, the manager will perform an HTTP request to the instance's heartbeat endpoint to check
+            if it's alive.
+        """
+        import pystray
+
+        self._instances: dict[int, TrayManagedInstance] = {}
+        self._lock = threading.Lock()
+        self._tray_icon: Optional["pystray.Icon"] = None
+        self._alive_check_use_pid = alive_check_use_pid
+        self._app = Flask(__name__)
+        self._setup_routes()
+        self._use_pywebview = use_pywebview
+
+    def _setup_routes(self) -> None:
+        @self._app.route("/health", methods=["GET"])
+        def health() -> dict[str, str]:
+            return {"status": "alive"}
+
+        @self._app.route("/register", methods=["POST"])
+        def register() -> dict[str, str]:
+            data = request.get_json()
+            instance = TrayManagedInstance(
+                port=data["port"],
+                parent_process=psutil.Process(data["pid"]),
+                dashboard_url=data["dashboard_url"],
+                project=data.get("project"),
+                started_at=data["started_at"],
+            )
+            log.info("Registering instance on port %d (project=%s)", instance.port, instance.project)
+            with self._lock:
+                self._instances[instance.port] = instance
+            self._update_menu()
+
+            # open a viewer immediately if requested
+            if data.get("open_viewer", False):
+                self._open_dashboard(instance)
+
+            return {"status": "registered"}
+
+        @self._app.route("/update_project", methods=["POST"])
+        def update_project() -> dict[str, str]:
+            data = request.get_json()
+            port = data["port"]
+            project = data.get("project")
+            with self._lock:
+                if port in self._instances:
+                    self._instances[port].project = project
+            self._update_menu()
+            log.info("Updated project for instance on port %d to '%s'", port, project)
+            return {"status": "updated"}
+
+        @self._app.route("/unregister", methods=["POST"])
+        def unregister() -> dict[str, str]:
+            data = request.get_json()
+            port = data["port"]
+            with self._lock:
+                self._instances.pop(port, None)
+            self._update_menu()
+            log.info("Unregistered instance on port %d", port)
+            return {"status": "unregistered"}
+
+    def _update_menu(self) -> None:
+        if self._tray_icon:
+            self._tray_icon.update_menu()
+
+    def _build_menu_items(self) -> tuple[Any, ...]:
+        """
+        Callable that returns the current tray menu items.
+
+        Invoked dynamically by pystray each time the menu is shown.
+        When there is exactly one instance, it is marked as the default action
+        so that a left-click on the tray icon opens the viewer immediately.
+        When there are multiple instances, a hidden default item forces the menu
+        to appear on left-click (Windows only; macOS always shows the menu).
+        """
+        from pystray import MenuItem as Item
+
+        with self._lock:
+            instances = list(self._instances.values())
+
+        if not instances:
+            return (Item("No instances", None, enabled=False),)
+
+        # determine whether a single-instance shortcut applies
+        is_single = len(instances) == 1
+
+        items: list[Any] = []
+
+        # for multi-instance: add a hidden default item that opens the menu on left-click
+        if not is_single:
+
+            def _force_show_menu(icon: Any, _item: Any) -> None:
+                if hasattr(icon, "_show_menu"):
+                    icon._show_menu()
+
+            items.append(Item("Instances", _force_show_menu, default=True, visible=False))
+
+        for inst in sorted(instances, key=lambda i: i.started_at):
+            label = f"{inst.project or 'SerenaAgent'} ({inst.started_at})"
+
+            # closure to capture the current instance
+            def _make_callback(instance: TrayManagedInstance) -> Callable:
+                def _callback(_icon: Any, _item: Any) -> None:
+                    self._open_dashboard(instance)
+
+                return _callback
+
+            items.append(Item(label, _make_callback(inst), default=is_single))
+
+        return tuple(items)
+
+    def _open_dashboard(self, instance: TrayManagedInstance) -> None:
+        """Opens the dashboard of the given instance."""
+        if self._use_pywebview:
+            # spawn pywebview process showing the dashboard
+            process = multiprocessing.Process(
+                target=self._run_viewer,
+                args=(instance.dashboard_url,),
+                daemon=True,
+            )
+            process.start()
+        else:
+            open_url_in_browser(instance.dashboard_url)
+
+    @staticmethod
+    def _run_viewer(url: str) -> None:
+        """Process target for running a dashboard viewer window."""
+        SerenaDashboardViewer(url, tray=False, start_minimized=False).run()
+
+    def _alive_check_loop(self) -> None:
+        """Periodically check whether registered instances are still reachable.
+
+        Removes unreachable instances and terminates the manager when none remain.
+        """
+        time.sleep(max(1, 5 - self.ALIVE_CHECK_INTERVAL_SECONDS))  # initial delay to allow instances to start and register
+
+        while True:
+            time.sleep(self.ALIVE_CHECK_INTERVAL_SECONDS)
+
+            try:
+                dead_ports: list[int] = []
+
+                if self._alive_check_use_pid:
+                    with self._lock:
+                        ports_and_processes = [(port, inst.parent_process) for port, inst in self._instances.items()]
+
+                    dead_ports = []
+                    for port, process in ports_and_processes:
+                        is_dead = False
+                        try:
+                            if not process.is_running():
+                                is_dead = True
+                        except psutil.NoSuchProcess:
+                            # parent process already exited
+                            is_dead = True
+                        if is_dead:
+                            dead_ports.append(port)
+                else:
+                    # collect ports to check
+                    with self._lock:
+                        ports_to_check = list(self._instances.keys())
+
+                    # probe each instance
+                    for port in ports_to_check:
+                        try:
+                            url = f"http://127.0.0.1:{port}/heartbeat"
+                            req = urllib.request.Request(url, method="GET")
+                            urllib.request.urlopen(req, timeout=1)
+                        except Exception:
+                            dead_ports.append(port)
+
+                # remove dead instances
+                if dead_ports:
+                    with self._lock:
+                        for port in dead_ports:
+                            self._instances.pop(port, None)
+                            log.info("Removed unreachable instance on port %d", port)
+
+                # terminate if no instances remain
+                with self._lock:
+                    remaining = len(self._instances)
+                if remaining == 0:
+                    log.info("No dashboard instances remaining; shutting down tray manager")
+                    if self._tray_icon is not None:
+                        self._tray_icon.stop()
+                    return
+
+            except Exception as e:
+                log.error("Error during alive check loop: %s", e, exc_info=e)
+
+    def run(self) -> None:
+        """Run the tray manager (blocking). Starts Flask, alive-check thread, and tray icon."""
+        import pystray
+
+        if self.DEBUG:
+            logging.configure(level=logging.DEBUG, stream=sys.stderr)
+            logging.add_file_logger(SerenaPaths().get_next_log_file_path("tray-manager"))
+
+        log.info("Starting tray manager")
+
+        dashboard_path = Path(SERENA_DASHBOARD_DIR)
+
+        # select the appropriate icon for the platform
+        icon_filename = "serena-icon-tray-mac.png" if sys.platform == "darwin" else "serena-icon-48.png"
+        icon_img = Image.open(dashboard_path / icon_filename)
+
+        # start Flask in a background thread
+        flask_thread = threading.Thread(
+            target=lambda: self._app.run(host=self.HOST, port=self.PORT, debug=False, use_reloader=False, threaded=True),
+            daemon=True,
+        )
+        flask_thread.start()
+
+        # start alive-check in a background thread
+        alive_thread = threading.Thread(target=self._alive_check_loop, daemon=True)
+        alive_thread.start()
+
+        # set up tray icon with a dynamic menu (callable returns items on each open)
+        kwargs: dict[str, Any] = {}
+        if sys.platform == "darwin":
+            from AppKit import NSApplication
+
+            kwargs["darwin_nsapplication"] = NSApplication.sharedApplication()
+
+        self._tray_icon = pystray.Icon(
+            "serena_tray_manager",
+            icon_img,
+            "Serena",
+            menu=pystray.Menu(self._build_menu_items),
+            **kwargs,
+        )
+
+        # blocks until stop() is called
+        self._tray_icon.run()
+
+    # ------------------------------------------------------------------
+    # Class-level helpers (used by agents to interact with the manager)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def is_current_platform_supported(cls) -> bool:
+        """
+        :return: whether the current platform supports the tray manager
+        """
+        # supported_platforms = ["win32", "darwin"]
+        # return sys.platform in supported_platforms
+        # TODO: Enable all platforms for the time being for users to try out (only Windows tested)
+        return True
+
+    @classmethod
+    def is_running(cls) -> bool:
+        """
+        :return: True if a tray manager process is already listening on the fixed port
+        """
+        try:
+            url = f"http://{cls.HOST}:{cls.PORT}/health"
+            req = urllib.request.Request(url, method="GET")
+            urllib.request.urlopen(req, timeout=2)
+            return True
+        except Exception:
+            return False
+
+    @classmethod
+    def ensure_running(cls) -> None:
+        """Ensure a tray manager process is running, starting one if necessary."""
+        log.info("Ensuring dashboard tray manager availability")
+        if cls.is_running():
+            log.info("Dashboard tray manager is already running")
+            return
+
+        # spawn a detached process
+        log.info("Starting new dashboard tray manager process")
+        cmd = [
+            sys.executable,
+            "-c",
+            "from serena.dashboard import SerenaDashboardTrayManager; SerenaDashboardTrayManager().run()",
+        ]
+        kwargs: dict[str, Any] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if sys.platform == "win32":
+            # CREATE_NO_WINDOW suppresses the console; CREATE_NEW_PROCESS_GROUP
+            # isolates the child from the parent's Ctrl+C group.
+            # Note: DETACHED_PROCESS must NOT be combined with CREATE_NO_WINDOW.
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            CREATE_NO_WINDOW = 0x08000000
+            kwargs["creationflags"] = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+        else:
+            kwargs["start_new_session"] = True
+
+        subprocess.Popen(cmd, **kwargs)
+
+        # wait for the manager to become available
+        for _ in range(30):
+            time.sleep(0.1)
+            if cls.is_running():
+                log.info("Dashboard tray manager started successfully")
+                return
+        log.warning("Dashboard tray manager did not start within the expected time")
+
+    @classmethod
+    def register_instance(cls, port: int, dashboard_url: str, project: str | None, started_at: str, open_viewer: bool = False) -> None:
+        """Register a dashboard instance with the running tray manager.
+
+        :param port: the port of the dashboard API (used for alive checks)
+        :param dashboard_url: the full URL to the dashboard frontend
+        :param project: the currently active project name, or None
+        :param started_at: ISO 8601 timestamp of when the agent was started
+        :param open_viewer: whether the tray manager should immediately open a viewer for this instance
+        """
+        url = f"http://{cls.HOST}:{cls.PORT}/register"
+        data = json.dumps(
+            {
+                "port": port,
+                "pid": os.getpid(),
+                "dashboard_url": dashboard_url,
+                "project": project,
+                "started_at": started_at,
+                "open_viewer": open_viewer,
+            }
+        ).encode()
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            urllib.request.urlopen(req, timeout=2)
+        except Exception as e:
+            log.warning("Failed to register with tray manager: %s", e)
+
+    @classmethod
+    def update_project(cls, port: int, project: str | None) -> None:
+        """Notify the tray manager of a project change for the given instance.
+
+        :param port: the port of the dashboard API
+        :param project: the new active project name, or None
+        """
+        url = f"http://{cls.HOST}:{cls.PORT}/update_project"
+        data = json.dumps({"port": port, "project": project}).encode()
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            urllib.request.urlopen(req, timeout=2)
+        except Exception as e:
+            log.warning("Failed to update project with tray manager: %s", e)
+
+    @classmethod
+    def unregister_instance(cls, port: int) -> None:
+        """Unregister a dashboard instance from the tray manager.
+
+        :param port: the port of the dashboard API to unregister
+        """
+        url = f"http://{cls.HOST}:{cls.PORT}/unregister"
+        data = json.dumps({"port": port}).encode()
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            urllib.request.urlopen(req, timeout=2)
+        except Exception as e:
+            log.warning("Failed to unregister from tray manager: %s", e)

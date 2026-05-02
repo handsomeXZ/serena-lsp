@@ -6,6 +6,9 @@ on:
     branches:
       - main
 
+permissions:
+    contents: read
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -20,7 +23,7 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ["3.11"]
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Free disk space
         if: runner.os == 'Linux'
         run: |
@@ -221,6 +224,10 @@ jobs:
         with:
           r-version: '4.4.2'
           use-public-rspm: true
+      - name: Install R sysdeps (libuv for fs package)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: sudo apt-get update && sudo apt-get install -y libuv1-dev
       - name: Install R language server
         shell: bash
         run: |
@@ -228,10 +235,10 @@ jobs:
       - name: Set up Julia
         uses: julia-actions/setup-julia@v2
         with:
-          version: '1.10'
+          version: '1.12.6'
       - name: Install Julia LanguageServer
         shell: bash
-        run: julia -e 'using Pkg; Pkg.add("LanguageServer")'
+        run: julia -e 'using Pkg; Pkg.add(Pkg.PackageSpec(name="LanguageServer", version="5.0.0"))'
       - name: Setup Haskell toolchain
         if: runner.os != 'Windows'
         uses: haskell/ghcup-setup@v1
@@ -386,6 +393,12 @@ jobs:
       - name: Install ansible-core and ansible-lint (for Ansible language server tests)
         shell: bash
         run: uv run pip install ansible-core ansible-lint
+      - name: Install Haxe
+        # The Haxe LS binary (server.js) is auto-downloaded and runs on Node.js,
+        # but it delegates to the Haxe compiler for code analysis at runtime.
+        uses: krdlab/setup-haxe@v2
+        with:
+          haxe-version: 4.3.7
       - name: Install Elm
         shell: bash
         run: npm install -g elm@0.19.1-6
@@ -566,7 +579,7 @@ jobs:
           df -h
       - name: Test with pytest
         shell: bash
-        run: uv run poe test
+        run: uv run poe test -q --tb=short
       - name: Type-checking with mypy
         shell: bash
         run: uv run poe type-check

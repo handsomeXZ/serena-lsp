@@ -11,6 +11,7 @@ from bs4 import BeautifulSoup
 from joblib import Parallel, delayed
 
 from serena.constants import DEFAULT_SOURCE_FILE_ENCODING
+from solidlsp.ls_utils import TextUtils
 
 log = logging.getLogger(__name__)
 
@@ -187,17 +188,16 @@ def search_text(
             end_pos = match.end()
 
             # Find the line numbers for the start and end positions
-            start_line_num = content[:start_pos].count("\n") + 1
-            end_line_num = content[:end_pos].count("\n") + 1
+            start_line_num = content[:start_pos].count("\n")
+            end_line_num = content[:end_pos].count("\n")
 
             # Calculate the range of lines to include in the context
-            context_start = max(1, start_line_num - context_lines_before)
-            context_end = min(total_lines, end_line_num + context_lines_after)
+            context_start = max(0, start_line_num - context_lines_before)
+            context_end = min(total_lines - 1, end_line_num + context_lines_after)
 
             # Create TextLine objects for the context
             context_lines = []
-            for i in range(context_start - 1, context_end):
-                line_num = i + 1
+            for line_num in range(context_start, context_end + 1):
                 if context_start <= line_num < start_line_num:
                     match_type = LineType.BEFORE_MATCH
                 elif end_line_num < line_num <= context_end:
@@ -205,7 +205,7 @@ def search_text(
                 else:
                     match_type = LineType.MATCH
 
-                context_lines.append(TextLine(line_number=line_num, line_content=lines[i], match_type=match_type))
+                context_lines.append(TextLine(line_number=line_num, line_content=lines[line_num], match_type=match_type))
 
             matches.append(MatchedConsecutiveLines(lines=context_lines, source_file_path=source_file_path))
     else:
@@ -214,7 +214,6 @@ def search_text(
         # Search line by line, normal compile without DOTALL
         compiled_pattern = re.compile(pattern)
         for i, line in enumerate(lines):
-            line_num = i + 1
             if compiled_pattern.search(line):
                 # Calculate the range of lines to include in the context
                 context_start = max(0, i - context_lines_before)
@@ -223,7 +222,6 @@ def search_text(
                 # Create TextLine objects for the context
                 context_lines = []
                 for j in range(context_start, context_end + 1):
-                    context_line_num = j + 1
                     if j < i:
                         match_type = LineType.BEFORE_MATCH
                     elif j > i:
@@ -231,7 +229,7 @@ def search_text(
                     else:
                         match_type = LineType.MATCH
 
-                    context_lines.append(TextLine(line_number=context_line_num, line_content=lines[j], match_type=match_type))
+                    context_lines.append(TextLine(line_number=j, line_content=lines[j], match_type=match_type))
 
                 matches.append(MatchedConsecutiveLines(lines=context_lines, source_file_path=source_file_path))
 
@@ -537,21 +535,29 @@ class TextCoords:
     """
 
 
-def find_text_coordinates(content: str, regex: str) -> TextCoords | None:
+def find_text_coordinates(content: str, regex: str, require_unique: bool = False) -> TextCoords | None:
     """
     Finds the line and column number of the first match of a regex pattern in the given content.
 
     :param content: the text content to search through
     :param regex: the regular expression pattern to search for; it must match part of a single line,
         and contain exactly one group that captures the position of interest (e.g., the exact variable name to find the coordinates of)
-    :return: a tuple of (line_number, column_number) for the first match found, both 0-based, or None if no match is found
+    :param require_unique: if True, raises an error if not exactly one match is found;
+        if False, returns None if no match is found, and returns the coordinates of the first match if multiple matches are found
+    :return: the coordinates of the match or None
     """
-    pattern = re.compile(regex)
-    for line_number, line in enumerate(content.splitlines()):
-        match = pattern.search(line)
-        if match:
-            if len(match.groups()) != 1:
-                raise ValueError(f"Regex must contain exactly one group to capture the position, but found {len(match.groups())} groups.")
-            column_number = match.start(1)
-            return TextCoords(line_number, column_number)
-    return None
+    pattern = re.compile(regex, flags=re.MULTILINE | re.DOTALL)
+    matches = list(pattern.finditer(content))
+    if len(matches) == 0:
+        if require_unique:
+            raise ValueError(f"No match found for regex: {regex}")
+        return None
+    else:
+        if require_unique and len(matches) > 1:
+            raise ValueError(f"Match must be unique; found {len(matches)} matches for regex: {regex}")
+        match = matches[0]
+        if len(match.groups()) != 1:
+            raise ValueError(f"Regex must contain exactly one group to capture the position, but found {len(match.groups())} groups.")
+        index_in_content = match.start(1)
+        line, col = TextUtils.get_line_col_from_index(content, index_in_content)
+        return TextCoords(line, col)

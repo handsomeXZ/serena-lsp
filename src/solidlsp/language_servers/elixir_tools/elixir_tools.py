@@ -4,11 +4,12 @@ import pathlib
 import stat
 import subprocess
 import threading
+from collections.abc import Hashable
 from typing import Any, cast
 
 from overrides import override
 
-from solidlsp.ls import SolidLanguageServer
+from solidlsp.ls import RawDocumentSymbol, SolidLanguageServer
 from solidlsp.ls_config import Language, LanguageServerConfig
 from solidlsp.ls_utils import FileUtils, PlatformId, PlatformUtils
 from solidlsp.lsp_protocol_handler.lsp_types import InitializeParams
@@ -215,6 +216,15 @@ class ElixirTools(SolidLanguageServer):
         # Set generous timeout for Expert which can be slow to initialize and respond
         self.set_request_timeout(180.0)
 
+    @override
+    def _document_symbols_cache_fingerprint(self) -> Hashable:
+        normalize_symbol_name_version = 1
+        return normalize_symbol_name_version
+
+    @override
+    def _normalize_symbol_name(self, symbol: RawDocumentSymbol, relative_file_path: str) -> str:
+        return symbol["name"].removeprefix("defp ").removeprefix("def ").split("(", 1)[0].strip()
+
     @staticmethod
     def _get_initialize_params(repository_absolute_path: str) -> InitializeParams:
         """
@@ -350,6 +360,28 @@ class ElixirTools(SolidLanguageServer):
 
         self.server.notify.initialized({})
 
+        # Expert's build pipeline is triggered by a textDocument/didOpen notification.
+        # Without it Expert sits idle and never emits the $/progress signals we wait for,
+        # causing a deadlock. Opening mix.exs is the minimal trigger; we close it again
+        # once the server is ready so it does not linger in the open-file set.
+        mix_exs_path = os.path.join(self.repository_root_path, "mix.exs")
+        mix_exs_uri = pathlib.Path(mix_exs_path).as_uri() if os.path.exists(mix_exs_path) else None
+
+        if mix_exs_uri is not None:
+            with open(mix_exs_path, encoding="utf-8") as f:
+                mix_exs_content = f.read()
+            self.server.notify.did_open_text_document(
+                {
+                    "textDocument": {
+                        "uri": mix_exs_uri,
+                        "languageId": "elixir",
+                        "version": 1,
+                        "text": mix_exs_content,
+                    }
+                }
+            )
+            log.debug("Opened mix.exs to trigger Expert's build pipeline")
+
         # Expert needs time to compile the project and build indexes on first run.
         # This can take 2-3+ minutes for mid-sized codebases.
         # After the first run, subsequent startups are much faster.
@@ -360,3 +392,7 @@ class ElixirTools(SolidLanguageServer):
         else:
             log.warning(f"Expert did not signal readiness within {ready_timeout}s. Proceeding with requests anyway.")
             self.server_ready.set()  # Mark as ready anyway to allow requests
+
+        if mix_exs_uri is not None:
+            self.server.notify.did_close_text_document({"textDocument": {"uri": mix_exs_uri}})
+            log.debug("Closed mix.exs after Expert is ready")

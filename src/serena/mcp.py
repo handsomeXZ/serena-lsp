@@ -3,7 +3,7 @@ The Serena Model Context Protocol (MCP) Server
 """
 
 import sys
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -270,9 +270,9 @@ class SerenaMCPFactory:
 
     def create_mcp_server(
         self,
-        host: str = "0.0.0.0",
+        host: str = "127.0.0.1",
         port: int = 8000,
-        modes: Sequence[str] = (),
+        mode_selection_def: ModeSelectionDefinition | None = None,
         language_backend: LanguageBackend | None = None,
         enable_web_dashboard: bool | None = None,
         enable_gui_log_window: bool | None = None,
@@ -286,7 +286,7 @@ class SerenaMCPFactory:
 
         :param host: The host to bind to
         :param port: The port to bind to
-        :param modes: List of mode names or paths to mode files
+        :param mode_selection_def: the mode selection definition to apply
         :param language_backend: the language backend to use, overriding the configuration setting.
         :param enable_web_dashboard: Whether to enable the web dashboard. If not specified, will take the value from the serena configuration.
         :param enable_gui_log_window: Whether to enable the GUI log window. It currently does not work on macOS, and setting this to True will be ignored then.
@@ -318,9 +318,6 @@ class SerenaMCPFactory:
             if language_backend is not None:
                 config.language_backend = language_backend
 
-            mode_selection_def: ModeSelectionDefinition | None = None
-            if modes:
-                mode_selection_def = ModeSelectionDefinition(default_modes=modes)
             self.agent = self._create_serena_agent(config, mode_selection_def)
 
         except Exception as e:
@@ -332,7 +329,15 @@ class SerenaMCPFactory:
         # retain only FASTMCP_ prefix for already set environment variables.
         Settings.model_config = SettingsConfigDict(env_prefix="FASTMCP_")
         instructions = self._get_initial_instructions()
-        mcp = FastMCP(lifespan=self.server_lifespan, host=host, port=port, instructions=instructions)
+        log.info("MCP server initial instructions:\n%s", instructions)
+        mcp = FastMCP(
+            name="Serena",
+            lifespan=self.server_lifespan,
+            website_url="https://oraios.github.io/serena",
+            host=host,
+            port=port,
+            instructions=instructions,
+        )
         return mcp
 
     @asynccontextmanager
@@ -346,8 +351,8 @@ class SerenaMCPFactory:
         finally:
             log.info("MCP server shutting down")
             if self.agent is not None:
-                self.agent.shutdown()
+                self.agent.on_shutdown()
 
     def _get_initial_instructions(self) -> str:
         assert self.agent is not None
-        return self.agent.create_system_prompt()
+        return self.agent.create_connection_prompt()

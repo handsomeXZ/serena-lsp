@@ -19,6 +19,9 @@ import pytest
 
 from solidlsp.ls import SolidLanguageServer
 from solidlsp.ls_config import Language
+from solidlsp.ls_types import SymbolKind
+from test.solidlsp.conftest import format_symbol_for_assert, has_malformed_name, request_all_symbols
+from test.solidlsp.util.diagnostics import assert_file_diagnostics
 
 
 @pytest.mark.haskell
@@ -216,4 +219,34 @@ class TestHaskellLanguageServer:
         calc_ref_paths = [ref["relativePath"] for ref in calculator_refs]
         assert any("Main.hs" in path or "Calculator.hs" in path for path in calc_ref_paths), (
             f"Expected Calculator to be referenced in Main.hs or Calculator.hs, got: {calc_ref_paths}"
+        )
+
+    @pytest.mark.parametrize("language_server", [Language.HASKELL], indirect=True)
+    def test_bare_symbol_names(self, language_server) -> None:
+        all_symbols = request_all_symbols(language_server)
+        malformed_symbols = []
+        for s in all_symbols:
+            if s["kind"] == SymbolKind.Module:
+                continue
+            if has_malformed_name(s):
+                malformed_symbols.append(s)
+        if malformed_symbols:
+            diagnostics = [
+                {
+                    "formatted": format_symbol_for_assert(sym),
+                    "name": sym["name"],
+                    "kind": SymbolKind(sym["kind"]).name,
+                    "detail": sym.get("detail"),
+                }
+                for sym in malformed_symbols
+            ]
+            pytest.fail(f"Found malformed symbols: {diagnostics}", pytrace=False)
+
+    @pytest.mark.parametrize("language_server", [Language.HASKELL], indirect=True)
+    def test_file_diagnostics(self, language_server: SolidLanguageServer) -> None:
+        assert_file_diagnostics(
+            language_server,
+            "src/DiagnosticsSample.hs",
+            (),
+            min_count=1,
         )

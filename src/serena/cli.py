@@ -14,11 +14,13 @@ from sensai.util import logging
 from sensai.util.logging import FileLoggerContext, datetime_tag
 from sensai.util.string import dict_string
 
-from serena.agent import SerenaAgent
+from serena import serena_version
+from serena.config.client_setup import client_setup_handlers
 from serena.config.context_mode import SerenaAgentContext, SerenaAgentMode
 from serena.config.serena_config import (
     LanguageBackend,
     ModeSelectionDefinition,
+    ModeSelectionDefinitionWithAddedModes,
     ProjectConfig,
     RegisteredProject,
     SerenaConfig,
@@ -32,10 +34,8 @@ from serena.constants import (
     SERENAS_OWN_MODE_YAMLS_DIR,
 )
 from serena.indexing import IndexingResult, _clangd_index_max_workers, _index_language_parallel, _index_language_serial, index_project
-from serena.mcp import SerenaMCPFactory
-from serena.project import Project
-from serena.tools import FindReferencingSymbolsTool, FindSymbolTool, GetSymbolsOverviewTool, SearchForPatternTool, ToolRegistry
-from serena.util.dataclass import get_dataclass_default
+from serena.prompt_factory import SerenaPromptFactory
+from serena.util.cli_util import AutoRegisteringGroup
 from serena.util.logging import MemoryLogHandler
 from solidlsp.ls_config import Language
 from solidlsp.ls_types import SymbolKind
@@ -43,16 +43,18 @@ from solidlsp.util.subprocess_util import subprocess_kwargs
 
 log = logging.getLogger(__name__)
 
-_MAX_CONTENT_WIDTH = 100
-_MODES_EXPLANATION = f"""\b\nBuilt-in mode names or paths to custom mode YAMLs with which to 
-override the default modes defined in the global Serena configuration or 
+_MAX_CONTENT_WIDTH = 200
+_MODES_EXPLANATION = """\b\nBuilt-in mode names or paths to custom mode YAMLs with which to 
+override the default_modes defined in the global Serena configuration or 
 the active project.
 For details on mode configuration, see 
   https://oraios.github.io/serena/02-usage/050_configuration.html#modes.
-If no configuration changes were made, the base defaults are: 
-  {get_dataclass_default(SerenaConfig, "default_modes")}.
-Overriding them means that they no longer apply, so you will need to 
-re-specify them in addition to further modes if you want to keep them."""
+"""
+_ADD_MODES_EXPLANATION = """\b\nMode names or paths to custom mode YAMLs which shall
+be added on top of the other modes specified by the global/project configuration.
+For details on mode configuration, see 
+  https://oraios.github.io/serena/02-usage/050_configuration.html#modes.
+"""
 
 
 def find_project_root(root: str | Path | None = None) -> str | None:
@@ -86,9 +88,6 @@ def find_project_root(root: str | Path | None = None) -> str | None:
             return str(directory)
 
     return None
-
-
-# --------------------- Utilities -------------------------------------
 
 
 def _open_in_editor(path: str) -> None:
@@ -126,32 +125,98 @@ class ProjectType(click.ParamType):
 PROJECT_TYPE = ProjectType()
 
 
-class AutoRegisteringGroup(click.Group):
-    """
-    A click.Group subclass that automatically registers any click.Command
-    attributes defined on the class into the group.
-
-    After initialization, it inspects its own class for attributes that are
-    instances of click.Command (typically created via @click.command) and
-    calls self.add_command(cmd) on each. This lets you define your commands
-    as static methods on the subclass for IDE-friendly organization without
-    manual registration.
-    """
-
-    def __init__(self, name: str, help: str):
-        super().__init__(name=name, help=help)
-        # Scan class attributes for click.Command instances and register them.
-        for attr in dir(self.__class__):
-            cmd = getattr(self.__class__, attr)
-            if isinstance(cmd, click.Command):
-                self.add_command(cmd)
-
-
 class TopLevelCommands(AutoRegisteringGroup):
     """Root CLI group containing the core Serena commands."""
 
     def __init__(self) -> None:
-        super().__init__(name="serena", help="Serena CLI commands. You can run `<command> --help` for more info on each command.")
+        super().__init__(
+            name="serena",
+            help="Main serena CLI commands. "
+            "Note that you also have access to `serena-hooks` CLI commands which are kept under "
+            "that separate entrypoint for performance reasons, see `serena-hooks --help`. You can run `<command> --help` for more info on each command.",
+        )
+
+        # register --version / -V flag
+        self.params.append(
+            click.Option(
+                ["--version", "-V"],
+                is_flag=True,
+                expose_value=False,
+                is_eager=True,
+                callback=self._print_version,
+                help="Show the version and exit.",
+            )
+        )
+
+    @staticmethod
+    def _print_version(ctx: click.Context, _param: click.Parameter, value: bool) -> None:
+        """Print version string and exit if the flag is set."""
+        if not value:
+            return
+        click.echo(f"Serena {serena_version()}")
+        ctx.exit()
+
+    @staticmethod
+    @click.command(
+        "init",
+        help="Initialize Serena by creating a global config file with the specified default language backend.",
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    @click.option(
+        "--language-backend",
+        "-b",
+        type=click.Choice([b.value for b in LanguageBackend]),
+        default=LanguageBackend.LSP.value,
+        show_default=True,
+        help="Default code intelligence backend (can be overridden in the project config).",
+    )
+    def init(language_backend: Literal["LSP", "JetBrains"] = "LSP") -> None:
+        click.echo(f"\nSerena version: {serena_version()}\n")
+        serena_config = SerenaConfig.from_config_file()
+        serena_config.language_backend = LanguageBackend(language_backend)
+        serena_config.save()
+        click.echo(f"Configuration file: {serena_config.config_file_path}")
+        click.echo(f"Language backend: {language_backend}")
+
+        # check for auto-configurable clients
+        applicable_setup_handlers = []
+        for setup_handler in client_setup_handlers:
+            if setup_handler.is_applicable():
+                applicable_setup_handlers.append(setup_handler)
+        if len(applicable_setup_handlers) > 0:
+            click.echo(
+                "\nAuto-configurable clients detected.\nApply the following commands to configure the Serena MCP server (in a default configuration):"
+            )
+            for setup_handler in applicable_setup_handlers:
+                click.echo(f"  serena setup {setup_handler.name}")
+
+        click.echo("\nSerena has been initialised successfully.\n")
+
+    @staticmethod
+    @click.command(
+        "setup",
+        help="Set up Serena for use with a specific client by registering it as an MCP server.",
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    @click.argument(
+        "client",
+        type=click.Choice([h.name for h in client_setup_handlers]),
+    )
+    def setup(client: str) -> None:
+        # find the matching handler
+        handler = next(h for h in client_setup_handlers if h.name == client)
+
+        # check applicability
+        if not handler.is_applicable():
+            click.echo(f"\nCannot apply setup for client '{client}' (not found or not functional).\n")
+            raise SystemExit(1)
+
+        # apply the setup
+        if handler.apply():
+            click.echo(f"\nSerena has been successfully set up for {client}.\n")
+        else:
+            click.echo(f"\nFailed to set up Serena for {client}.\n")
+            raise SystemExit(1)
 
     @staticmethod
     @click.command("start-mcp-server", help="Starts the Serena MCP server.", context_settings={"max_content_width": _MAX_CONTENT_WIDTH})
@@ -163,12 +228,21 @@ class TopLevelCommands(AutoRegisteringGroup):
     )
     @click.option(
         "--mode",
-        "modes",
+        "default_modes",
         type=str,
         multiple=True,
         default=(),
         show_default=False,
         help=_MODES_EXPLANATION,
+    )
+    @click.option(
+        "--add-mode",
+        "added_modes",
+        type=str,
+        multiple=True,
+        default=(),
+        show_default=False,
+        help=_ADD_MODES_EXPLANATION,
     )
     @click.option(
         "--language-backend",
@@ -186,7 +260,7 @@ class TopLevelCommands(AutoRegisteringGroup):
     @click.option(
         "--host",
         type=str,
-        default="0.0.0.0",
+        default="127.0.0.1",
         show_default=True,
         help="Listen address for the MCP server (when using corresponding transport).",
     )
@@ -235,7 +309,8 @@ class TopLevelCommands(AutoRegisteringGroup):
         project_file_arg: str | None,
         project_from_cwd: bool | None,
         context: str,
-        modes: Sequence[str],
+        default_modes: Sequence[str],
+        added_modes: Sequence[str],
         language_backend: str | None,
         transport: Literal["stdio", "sse", "streamable-http"],
         host: str,
@@ -247,6 +322,8 @@ class TopLevelCommands(AutoRegisteringGroup):
         trace_lsp_communication: bool | None,
         tool_timeout: float | None,
     ) -> None:
+        from serena.mcp import SerenaMCPFactory
+
         # initialize logging, using INFO level initially (will later be adjusted by SerenaAgent according to the config)
         #   * memory log handler (for use by GUI/Dashboard)
         #   * stream handler for stderr (for direct console output, which will also be captured by clients like Claude Desktop)
@@ -278,11 +355,16 @@ class TopLevelCommands(AutoRegisteringGroup):
                 log.warning("No project root found from %s; not activating any project", os.getcwd())
 
         project_file = project_file_arg or project
+
+        mode_selection_def: ModeSelectionDefinition | None = None
+        if default_modes or added_modes:
+            mode_selection_def = ModeSelectionDefinitionWithAddedModes(default_modes=default_modes or None, added_modes=added_modes or None)
+
         factory = SerenaMCPFactory(context=context, project=project_file, memory_log_handler=memory_log_handler)
         server = factory.create_mcp_server(
             host=host,
             port=port,
-            modes=modes,
+            mode_selection_def=mode_selection_def,
             language_backend=LanguageBackend.from_str(language_backend) if language_backend else None,
             enable_web_dashboard=enable_web_dashboard,
             open_web_dashboard=open_web_dashboard,
@@ -326,9 +408,10 @@ class TopLevelCommands(AutoRegisteringGroup):
     def print_system_prompt(
         project: str, log_level: str, only_instructions: bool, context: str, modes: Sequence[str] | None = None
     ) -> None:
+        from serena.agent import SerenaAgent
+
         prefix = "You will receive access to Serena's symbolic tools. Below are instructions for using them, take them into account."
         postfix = "You begin by acknowledging that you understood the above instructions and are ready to receive tasks."
-        from serena.tools.workflow_tools import InitialInstructionsTool
 
         lvl = logging.getLevelNamesMapping()[log_level.upper()]
         logging.configure(level=lvl)
@@ -336,14 +419,18 @@ class TopLevelCommands(AutoRegisteringGroup):
         modes_selection_def: ModeSelectionDefinition | None = None
         if modes:
             modes_selection_def = ModeSelectionDefinition(default_modes=modes)
+        serena_config = SerenaConfig.from_config_file()
+        serena_config.web_dashboard = False
+        print(serena_config.default_modes)
+        print(serena_config.base_modes)
+
         agent = SerenaAgent(
             project=os.path.abspath(project),
-            serena_config=SerenaConfig(web_dashboard=False, log_level=lvl),
+            serena_config=serena_config,
             context=context_instance,
             modes=modes_selection_def,
         )
-        tool = agent.get_tool(InitialInstructionsTool)
-        instr = tool.apply()
+        instr = agent.create_system_prompt()
         if only_instructions:
             print(instr)
         else:
@@ -403,6 +490,21 @@ class TopLevelCommands(AutoRegisteringGroup):
         if port is not None:
             run_kwargs["port"] = port
         server.run(**run_kwargs)
+
+    @staticmethod
+    @click.command(
+        "dashboard-viewer",
+        help="Open the Serena dashboard viewer for a given URL.",
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    @click.argument("url", type=str)
+    @click.option("--width", type=int, default=1400, show_default=True, help="Window width.")
+    @click.option("--height", type=int, default=900, show_default=True, help="Window height.")
+    def dashboard_viewer(url: str, width: int, height: int) -> None:
+        from serena.dashboard import SerenaDashboardViewer
+
+        viewer = SerenaDashboardViewer(url, width=width, height=height)
+        viewer.run()
 
 
 class ModeCommands(AutoRegisteringGroup):
@@ -759,6 +861,8 @@ class ProjectCommands(AutoRegisteringGroup):
         :param path: The path to check.
         :param project: The path to the project directory, defaults to the current working directory.
         """
+        from serena.project import Project
+
         serena_config = SerenaConfig.from_config_file()
         proj = Project.load(os.path.abspath(project), serena_config=serena_config)
         if os.path.isabs(path):
@@ -782,6 +886,8 @@ class ProjectCommands(AutoRegisteringGroup):
         :param project: path to the project directory, defaults to the current working directory.
         :param verbose: if set, prints detailed information about the indexed symbols.
         """
+        from serena.project import Project
+
         serena_config = SerenaConfig.from_config_file()
         proj = Project.load(os.path.abspath(project), serena_config=serena_config)
         if os.path.isabs(file):
@@ -818,6 +924,10 @@ class ProjectCommands(AutoRegisteringGroup):
         :param project: path to the project directory, defaults to the current working directory.
         """
         # NOTE: completely written by Claude Code, only functionality was reviewed, not implementation
+        from serena.agent import SerenaAgent
+        from serena.project import Project
+        from serena.tools import FindReferencingSymbolsTool, FindSymbolTool, GetSymbolsOverviewTool, SearchForPatternTool
+
         logging.configure(level=logging.INFO)
         project_path = os.path.abspath(project)
         serena_config = SerenaConfig.from_config_file()
@@ -971,6 +1081,8 @@ class ToolCommands(AutoRegisteringGroup):
     @click.option("--all", "-a", "include_optional", is_flag=True, help="List all tools, including those not enabled by default.")
     @click.option("--only-optional", is_flag=True, help="List only optional tools (those not enabled by default).")
     def list(quiet: bool = False, include_optional: bool = False, only_optional: bool = False) -> None:
+        from serena.tools import ToolRegistry
+
         tool_registry = ToolRegistry()
         if quiet:
             if only_optional:
@@ -993,6 +1105,9 @@ class ToolCommands(AutoRegisteringGroup):
     @click.argument("tool_name", type=str)
     @click.option("--context", type=str, default=None, help="Context name or path to context file.")
     def description(tool_name: str, context: str | None = None) -> None:
+        from serena.agent import SerenaAgent
+        from serena.mcp import SerenaMCPFactory
+
         # Load the context
         serena_context = None
         if context:
@@ -1020,16 +1135,26 @@ class PromptCommands(AutoRegisteringGroup):
 
     @staticmethod
     @click.command(
-        "list", help="Lists yamls that are used for defining prompts.", context_settings={"max_content_width": _MAX_CONTENT_WIDTH}
+        "list", help="Lists prompt names and YAML files that can be overridden.", context_settings={"max_content_width": _MAX_CONTENT_WIDTH}
     )
     def list() -> None:
+        # list prompt names
+        click.echo("Prompts:")
+        factory = SerenaPromptFactory()
+        for key in factory.get_prompt_names():
+            template = factory.get_prompt_template(key)
+            is_overridden = not template.path.startswith(PROMPT_TEMPLATES_DIR_INTERNAL)
+            click.echo(f" * '{key}' ({template.path if is_overridden else 'default'})")
+
+        # list prompts files
+        click.echo("\nPrompt files (which you can override with the create-override command):")
         serena_prompt_yaml_names = [os.path.basename(f) for f in glob.glob(PROMPT_TEMPLATES_DIR_INTERNAL + "/*.yml")]
         for prompt_yaml_name in serena_prompt_yaml_names:
             user_prompt_yaml_path = PromptCommands._get_user_prompt_yaml_path(prompt_yaml_name)
             if os.path.exists(user_prompt_yaml_path):
-                click.echo(f"{user_prompt_yaml_path} merged with default prompts in {prompt_yaml_name}")
+                click.echo(f" * {user_prompt_yaml_path} merged with default prompts in {prompt_yaml_name}")
             else:
-                click.echo(prompt_yaml_name)
+                click.echo(f" * {prompt_yaml_name}")
 
     @staticmethod
     @click.command(
@@ -1102,24 +1227,37 @@ class PromptCommands(AutoRegisteringGroup):
         os.remove(user_prompt_yaml_path)
         click.echo(f"Deleted override file '{prompt_yaml_name}'.")
 
+    @staticmethod
+    @click.command(
+        "print-prompt-template",
+        help="prints the (unrendered) template for the corresponding prompt name. "
+        "This respects custom prompt yaml overrides and thus will print the value that will be used in Serena",
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    @click.argument("prompt_name", type=str)
+    def print_prompt_template(prompt_name: str) -> None:
+        click.echo(SerenaPromptFactory().get_prompt_template_string(prompt_name))
 
-# Expose groups so we can reference them in pyproject.toml
-mode = ModeCommands()
-context = ContextCommands()
-project = ProjectCommands()
-config = SerenaConfigCommands()
-tools = ToolCommands()
-prompts = PromptCommands()
+    @staticmethod
+    @click.command(
+        "print-cc-system-prompt-override",
+        help="To be used specifically in Claude Code as value for `--system-prompt`",
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    def print_cc_system_prompt_override() -> None:
+        click.echo(SerenaPromptFactory().create_cc_system_prompt_override())
 
-# Expose toplevel commands for the same reason
+
+_mode = ModeCommands()
+_context = ContextCommands()
+_project = ProjectCommands()
+_config = SerenaConfigCommands()
+_tools = ToolCommands()
+_prompts = PromptCommands()
+
+# Expose so we can use this as an entrypoint
 top_level = TopLevelCommands()
-start_mcp_server = top_level.start_mcp_server
 
 # needed for the help script to work - register all subcommands to the top-level group
-for subgroup in (mode, context, project, config, tools, prompts):
+for subgroup in (_mode, _context, _project, _config, _tools, _prompts):
     top_level.add_command(subgroup)
-
-
-def get_help() -> str:
-    """Retrieve the help text for the top-level Serena CLI."""
-    return top_level.get_help(click.Context(top_level, info_name="serena"))

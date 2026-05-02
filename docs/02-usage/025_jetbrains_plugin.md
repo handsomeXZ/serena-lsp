@@ -1,7 +1,11 @@
 # The Serena JetBrains Plugin
 
-The [JetBrains Plugin](https://plugins.jetbrains.com/plugin/28946-serena/) allows Serena to
+The [JetBrains Plugin](https://plugins.jetbrains.com/plugin/28946-serena/) allows the Serena MCP server to
 leverage the powerful code analysis and editing capabilities of your JetBrains IDE.
+This page explains how to install the plugin and how to configure Serena appropriately.   
+You will still need to set up the Serena MCP server 
+itself, so make sure to follow the [installation instructions](020_running.md) and connect the MCP server to your 
+LLM-based client as described in [client setup](030_clients.md) in addition to following the instructions below.
 
 ```{raw} html
 <p>
@@ -14,40 +18,73 @@ leverage the powerful code analysis and editing capabilities of your JetBrains I
 We recommend the JetBrains plugin as the preferred way of using Serena,
 especially for users of JetBrains IDEs.
 
+**How it works:**
+1. Install the plugin in your JetBrains IDE
+2. Configure Serena to use the JetBrains language backend (see [below](configure-jetbrains))
+3. Open the project you want to work on in your JetBrains IDE and activate it in Serena (see [below](jetbrains-workflow))
+4. Start coding via your MCP client as usual
+
+```{admonition} *Note:* The plugin is a language intelligence backend for the Serena MCP server. 
+:class: note
+It is *not* a UI extension for direct agent interaction (like Copilot) or anything of the sort.    
+You still interact with your regular client – be it external to your IDE (like Claude Code CLI) or internal (like Copilot or JetBrains AI Assistant) –
+and connect it to the Serena MCP server.  
+The plugin simply enables the Serena MCP server to directly leverage capabilities of your JetBrains IDE!
+```
+
 **Purchasing the JetBrains Plugin supports the Serena project.**
 The proceeds from plugin sales allow us to dedicate more resources to further developing and improving Serena.
-
 
 ## Advantages of the JetBrains Plugin
 
 There are multiple features that are only available when using the JetBrains plugin:
 
 * **External library indexing**: Dependencies and libraries are fully indexed and accessible to Serena
-* **No additional setup**: No need to download or configure separate language servers
-* **Enhanced performance**: Faster tool execution thanks to optimized IDE integration
-* **Multi-language excellence**: First-class support for polyglot projects with multiple languages and frameworks
-* **Enhanced retrieval capabilities**: The plugin supports additional retrieval tools for type hierarchy information as well as fast and reliable documentation/type signature retrieval
+* **Enhanced retrieval & refactoring capabilities**: The plugin adds additional [tools](../01-about/035_tools) (e.g. type
+  hierarchy retrieval, move, find declaration, inline symbol, etc.) 
+  and transforms the underlying mechanisms of shared tools to build upon the IDE's capabilities.
+* **Interactive debugging**: The agent can set breakpoints, inspect variables, evaluate expressions and control execution flow
+  by directly interacting with the IDE's debugger, using a REPL-style interface for maximum flexibility.
+* **Improved multi-agent support**: A single IDE instance naturally serves arbitrarily many agent sessions without requiring additional resources.
+* **Enhanced performance**: Faster tool execution thanks to optimized IDE integration.
+* **Multi-language excellence** and **framework support**: First-class support for polyglot projects with multiple languages. 
+  and frameworks (whatever is recognised by your IDE as a symbol will also be available to Serena)
+* **No additional setup**: No need to download or configure separate language servers.
 
-We are also working on additional features like a `move_symbol` tool and debugging-related capabilities that
+We are also working on additional features like debugging and advanced introspection capabilities, which
 will be available exclusively through the JetBrains plugin.
 
+:::{note}
+With Serena's JetBrains tools, we try to offer the latest features.
+As a result, some of them are considered as beta features (see [tool list](../01-about/035_tools)), which may have some quirks.
+Please report your experience with these tools if they do not work as expected. 
+:::
+
+(configure-jetbrains)=
 ## Configuring Serena to Use the JetBrains Plugin
 
 After installing the plugin, you need to configure Serena to use it.
 
 **Central Configuration**.
 
-Edit the global Serena configuration file located at `~/.serena/serena_config.yml` 
-(`%USERPROFILE%\.serena\serena_config.yml` on Windows).
-Change the `language_backend` setting as follows:
+You can run
+
+```shell
+serena init -b JetBrains
+```
+
+to set the default code intelligence backend to JetBrains in the global Serena configuration file.
+
+Alternatively, manually edit the configuration file  `~/.serena/serena_config.yml` 
+(`%USERPROFILE%\.serena\serena_config.yml` on Windows) and set
 
 ```yaml
 language_backend: JetBrains
 ```
 
-*Note*: you can also use the button `Edit Global Serena Config` in the Serena MCP dashboard to open the config file in your default editor.
+Note that the file might not exist yet if you never executed Serena before.
 
-**Per-Instance Configuration**.
+**Per-Server Instance Configuration**.
 The configuration setting in the global config file can be overridden on a
 per-instance basis by providing the arguments `--language-backend JetBrains` when
 launching the Serena MCP server.
@@ -79,15 +116,17 @@ you will see `Languages:
 Using JetBrains backend` in the configuration overview.
 You will also notice that your client will use the JetBrains-specific tools like `jet_brains_find_symbol` and others like it.
 
+(jetbrains-workflow)=
 ## Workflow
 
 Having installed the plugin in your IDE and having configured Serena to use the JetBrains backend,
 the general workflow is simple:
-1. Open the project you want to work on in your JetBrains IDE
-2. Open the project's root folder as a project in Serena (see [Project Creation](project-creation-indexing) and [Project Activation](project-activation))
-3. Start using Serena tools as usual
+1. Open the project you want to work on in your JetBrains IDE.  
+   Note that the project must be appropriately set up in your IDE, i.e. symbol lookups for all relevant programming languages and frameworks should work in the IDE.
+2. Activate the project's root folder as a project in Serena (see [Project Creation](project-creation-indexing) and [Project Activation](project-activation)).
+3. Start using Serena's tools as usual.
 
-Note that the folder that is open in your IDE and the project's root folder must match.
+Note that the project folder that is open in your IDE and the Serena project root folder must match.
 
 :::{tip}
 If you need to work on multiple projects in the same agent session, create a monorepo folder

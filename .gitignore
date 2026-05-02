@@ -79,6 +79,8 @@ downloads/
 eggs/
 .eggs/
 lib/
+!test/resources/repos/dart/test_repo/lib/
+!test/resources/repos/dart/test_repo/lib/diagnostics_sample.dart
 lib64/
 parts/
 sdist/
@@ -216,7 +218,7 @@ tmp/
 .vscode/
 
 # Claude settings
-.claude/settings.local.json
+/.claude
 
 # Local agent/tooling artifacts
 /.playwright-mcp/
@@ -279,3 +281,5 @@ cabal.project.local*
 
 zz-misc/
 vue-implementation/
+
+news/news.json
