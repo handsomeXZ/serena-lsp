@@ -40,6 +40,27 @@ class ClangdLanguageServer(SolidLanguageServer):
         self.initialize_searcher_command_available = threading.Event()
         self.resolve_main_method_available = threading.Event()
 
+    @staticmethod
+    def _determine_log_level(line: str) -> int:
+        stripped_line = line.lstrip()
+        if stripped_line.startswith("E["):
+            return logging.ERROR
+        if stripped_line.startswith("W["):
+            return logging.WARNING
+        if stripped_line.startswith(("I[", "V[")):
+            return logging.INFO
+
+        lower_line = stripped_line.lower()
+        is_compiler_command = (
+            lower_line.startswith('"')
+            and ("clang" in lower_line or "cl.exe" in lower_line)
+            and (" -- " in lower_line or " /i " in lower_line or " /std:" in lower_line)
+        )
+        if is_compiler_command:
+            return logging.INFO
+
+        return SolidLanguageServer._determine_log_level(line)
+
     def _prepare_compile_commands(self) -> str | None:
         """
         Prepare clangd compilation database with absolute directory paths.
