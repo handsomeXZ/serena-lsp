@@ -36,6 +36,7 @@ Status of the `main` branch. Changes prior to the next official version change w
     `permission_mode == "auto"`, in addition to the existing `acceptEdits` behavior. #1386
   - Extension: heuristics for parsing commands and firing a hook on too many greps or reads. Important for clients that, unlike claude code, don't have dedicated grep/read tools.
   - Read hook now only fires on reads of code files (using heuristics to parse the read command string)
+  - Reminder hook now also counts and fires on usages of serena's non-symbolic tools.
 
 # v1.2.0 (2026-04-27)
 
