@@ -904,7 +904,16 @@ class SerenaDashboardViewer(WebViewWithTray):
             app_id="oraios.serena",
             app_icon_path=app_icon_path,
             tray_icon_path=tray_icon_path,
+            quit_handler=self._request_agent_shutdown,
         )
+
+    def _request_agent_shutdown(self) -> None:
+        shutdown_url = self._url.replace("/dashboard/index.html", "/shutdown")
+        try:
+            req = urllib.request.Request(shutdown_url, method="PUT")
+            urllib.request.urlopen(req, timeout=2)
+        except Exception as e:
+            log.warning("Failed to request Serena agent shutdown from dashboard viewer: %s", e)
 
     @staticmethod
     def is_current_platform_supported() -> bool:
