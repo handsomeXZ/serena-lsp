@@ -5,7 +5,6 @@ import logging
 import os
 import pathlib
 import shutil
-import subprocess
 import threading
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -25,7 +24,7 @@ from serena.util.text_utils import MatchedConsecutiveLines
 from solidlsp import ls_types
 from solidlsp.ls_config import FilenameMatcher, Language, LanguageServerConfig
 from solidlsp.ls_exceptions import SolidLSPException
-from solidlsp.ls_process import LanguageServerProcess
+from solidlsp.ls_process import LanguageServerInterface, StdioLanguageServer
 from solidlsp.ls_types import UnifiedSymbolInformation
 from solidlsp.ls_utils import FileUtils, PathUtils, TextUtils
 from solidlsp.lsp_protocol_handler import lsp_types
@@ -336,8 +335,7 @@ class LanguageServerDependencyProviderSinglePath(LanguageServerDependencyProvide
 
 class SolidLanguageServer(ABC):
     """
-    The LanguageServer class provides a language agnostic interface to the Language Server Protocol.
-    It is used to communicate with Language Servers of different programming languages.
+    High-level abstraction for language server interaction, which wraps the underlying low-level LSP interface
     """
 
     CACHE_FOLDER_NAME = "cache"
@@ -551,13 +549,16 @@ class SolidLanguageServer(ABC):
             self._dependency_provider = self._create_dependency_provider()
             process_launch_info = self._create_process_launch_info()
         log.debug(f"Creating language server instance with {language_id=} and process launch info: {process_launch_info}")
-        self.server = LanguageServerProcess(
+        self.server = StdioLanguageServer(
             process_launch_info,
             language=self.language,
             determine_log_level=self._determine_log_level,
             logger=logging_fn,
             start_independent_lsp_process=config.start_independent_lsp_process,
         )
+        """
+        the low-level language server interface
+        """
         self.server.on_any_notification(self._observe_server_notification)
 
         # Set up the pathspec matcher for the ignored paths
@@ -1208,7 +1209,7 @@ class SolidLanguageServer(ABC):
         try:
             log.debug("Sending LSP shutdown request...")
             # Use a thread to timeout the LSP shutdown call since it can hang
-            shutdown_thread = threading.Thread(target=self.server.shutdown)
+            shutdown_thread = threading.Thread(target=self.server.send_shutdown)
             shutdown_thread.daemon = True
             shutdown_thread.start()
             shutdown_thread.join(timeout=2.0)  # 2 second timeout for LSP shutdown
@@ -3131,7 +3132,7 @@ class SolidLanguageServer(ABC):
         return self
 
     @property
-    def handler(self) -> LanguageServerProcess:
+    def handler(self) -> LanguageServerInterface:
         """Access the underlying language server handler.
 
         Useful for advanced operations like sending custom commands
