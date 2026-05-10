@@ -3,6 +3,7 @@ import os
 import sys
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 import psutil
@@ -32,6 +33,7 @@ class WebViewWithTray:
         app_id: str | None = None,
         app_icon_path: str | None = None,
         tray_icon_path: str | None = None,
+        quit_handler: Callable[[], None] | None = None,
     ):
         """
         :param url: the URL to be show in the web view
@@ -45,6 +47,7 @@ class WebViewWithTray:
             shut itself down when the parent process exits.
         :param app_id: the application ID to use for the viewer to ensure that the window is grouped separately (with separate
             icon) in the taskbar
+        :param quit_handler: optional callback invoked before terminating the viewer from the tray Quit action.
         """
         self._url = url
         self._use_tray = tray
@@ -58,6 +61,7 @@ class WebViewWithTray:
         self._quitting = False
         self._app_icon_path = app_icon_path
         self._tray_icon_path = tray_icon_path
+        self._quit_handler = quit_handler
 
         # Create hidden to avoid flash; show/restore/minimize in start callback.
         window = webview.create_window(
@@ -207,6 +211,8 @@ class WebViewWithTray:
             self._hide_window()
 
         def quit_app(_icon: TrayIcon, _item: Item) -> None:
+            if self._quit_handler is not None:
+                self._quit_handler()
             self._terminate()
 
         menu = pystray.Menu(
