@@ -189,6 +189,10 @@ class LanguageServerInterface(ABC):
         :param timeout: the maximum time, in seconds, to wait for the language server to terminate before forcefully killing it
             (if applicable)
         """
+        if not self.is_running():
+            log.debug("Server process not running, skipping shutdown.")
+            return
+
         self._is_stopping = True
         self._stop(timeout)
 
@@ -206,6 +210,23 @@ class LanguageServerInterface(ABC):
         log.info("Sending exit notification to server")
         self.notify.exit()
         log.info("Sent exit notification to server")
+
+    def _send_shutdown_in_thread(self) -> None:
+        """
+        Signals shutdown to the server in a separate thread (requests can hang),
+        and waits for the thread to complete with a timeout.
+
+        :param timeout: timeout, in seconds, to wait for the requests to be handled
+        """
+        log.debug("Sending LSP shutdown request...")
+        shutdown_thread = threading.Thread(target=self._send_shutdown)
+        shutdown_thread.daemon = True
+        shutdown_thread.start()
+        shutdown_thread.join(timeout=2.0)
+        if shutdown_thread.is_alive():
+            log.debug("LSP shutdown request timed out, proceeding to terminate...")
+        else:
+            log.debug("LSP shutdown request completed.")
 
     def _trace(self, src: str, dest: str, message: str | StringDict) -> None:
         """
@@ -481,76 +502,45 @@ class StdioLanguageServer(LanguageServerInterface):
         A robust shutdown process designed to terminate cleanly on all platforms, including Windows,
         by explicitly closing all I/O pipes.
         """
-        if not self.is_running():
-            log.debug("Server process not running, skipping shutdown.")
-            return
-
         log.info(f"Initiating final robust shutdown with a {timeout}s timeout...")
         process = self.process
         if process is None:
             log.debug("Server process is None, cannot shutdown.")
             return
 
-        # --- Main Shutdown Logic ---
-        # Stage 1: Graceful Termination Request
-        # Send LSP shutdown and close stdin to signal no more input.
         try:
-            log.debug("Sending LSP shutdown request...")
-            # Use a thread to timeout the LSP shutdown call since it can hang
-            shutdown_thread = threading.Thread(target=self._send_shutdown)
-            shutdown_thread.daemon = True
-            shutdown_thread.start()
-            shutdown_thread.join(timeout=2.0)  # 2 second timeout for LSP shutdown
-
-            if shutdown_thread.is_alive():
-                log.debug("LSP shutdown request timed out, proceeding to terminate...")
-            else:
-                log.debug("LSP shutdown request completed.")
-
-            if process.stdin and not process.stdin.closed:
-                process.stdin.close()
-            log.debug("Stage 1 shutdown complete.")
-        except Exception as e:
-            log.debug(f"Exception during graceful shutdown: {e}")
-            # Ignore errors here, we are proceeding to terminate anyway.
-
-        # Stage 2: Terminate and Wait for Process to Exit
-        log.debug(f"Terminating process {process.pid}, current status: {process.poll()}")
-        process.terminate()
-
-        # Stage 3: Wait for process termination with timeout
-        try:
-            log.debug(f"Waiting for process {process.pid} to terminate...")
-            exit_code = process.wait(timeout=timeout)
-            log.info(f"Language server process terminated successfully with exit code {exit_code}.")
-        except subprocess.TimeoutExpired:
-            # If termination failed, forcefully kill the process
-            log.warning(f"Process {process.pid} termination timed out, killing process forcefully...")
-            process.kill()
+            # --- Main Shutdown Logic ---
+            # Stage 1: Graceful Termination Request
+            # Send LSP shutdown and close stdin to signal no more input.
             try:
-                exit_code = process.wait(timeout=2.0)
-                log.info(f"Language server process killed successfully with exit code {exit_code}.")
+                self._send_shutdown_in_thread()
+                self._safely_close_pipe(process.stdin)
+                log.debug("Stage 1 shutdown complete.")
+            except Exception as e:
+                log.debug(f"Exception during graceful shutdown: {e}")
+                # Ignore errors here, we are proceeding to terminate anyway.
+
+            # Stage 2: Terminate and Wait for Process to Exit
+            log.debug(f"Terminating process {process.pid}, current status: {process.poll()}")
+            self._signal_process_tree(process, terminate=True)
+            try:
+                log.debug(f"Waiting for process {process.pid} to terminate...")
+                exit_code = process.wait(timeout=timeout)
+                log.info(f"Language server process terminated successfully with exit code {exit_code}.")
             except subprocess.TimeoutExpired:
-                log.error(f"Process {process.pid} could not be killed within timeout.")
-        except Exception as e:
-            log.error(f"Error during process shutdown: {e}")
+                # If termination failed, forcefully kill the process
+                log.warning(f"Process {process.pid} termination timed out, killing process forcefully...")
+                self._signal_process_tree(process, terminate=False)
+                try:
+                    exit_code = process.wait(timeout=2.0)
+                    log.info(f"Language server process killed successfully with exit code {exit_code}.")
+                except subprocess.TimeoutExpired:
+                    log.error(f"Process {process.pid} could not be killed within timeout.")
 
-    def _cleanup_process(self, process: subprocess.Popen[bytes]) -> None:
-        """Clean up a process: close stdin, terminate/kill process, close stdout/stderr."""
-        # Close stdin first to prevent deadlocks
-        # See: https://bugs.python.org/issue35539
-        self._safely_close_pipe(process.stdin)
-
-        # Terminate/kill the process if it's still running
-        if process.returncode is None:
-            self._terminate_or_kill_process(process)
-
-        # Close stdout and stderr pipes after process has exited
-        # This is essential to prevent "I/O operation on closed pipe" errors and
-        # "Event loop is closed" errors during garbage collection
-        # See: https://bugs.python.org/issue41320 and https://github.com/python/cpython/issues/88050
-        self._safely_close_pipe(process.stdout)
-        self._safely_close_pipe(process.stderr)
+            except Exception as e:
+                log.error(f"Error during process shutdown: {e}")
+        finally:
+            self.process = None
 
     @staticmethod
     def _safely_close_pipe(pipe: IO[AnyStr] | None) -> None:
@@ -561,14 +551,21 @@ class StdioLanguageServer(LanguageServerInterface):
             except Exception:
                 pass
 
-    def _terminate_or_kill_process(self, process: subprocess.Popen[bytes]) -> None:
-        """Try to terminate the process gracefully, then forcefully if necessary."""
-        # First try to terminate the process tree gracefully
-        self._signal_process_tree(process, terminate=True)
-
     def _signal_process_tree(self, process: subprocess.Popen[bytes], terminate: bool = True) -> None:
-        """Send signal (terminate or kill) to the process and all its children."""
-        signal_method = "terminate" if terminate else "kill"
+        """
+        Sends a signal (terminate or kill) to the given process and all its children.
+
+        :param terminate: if True, signal terminate, otherwise signal kill
+        """
+
+        def signal_process(p: subprocess.Popen | psutil.Process) -> None:
+            try:
+                if terminate:
+                    p.terminate()
+                else:
+                    p.kill()
+            except:
+                pass
 
         # Try to get the parent process
         parent = None
@@ -579,24 +576,12 @@ class StdioLanguageServer(LanguageServerInterface):
 
         # If we have the parent process and it's running, signal the entire tree
         if parent and parent.is_running():
-            # Signal children first
             for child in parent.children(recursive=True):
-                try:
-                    getattr(child, signal_method)()
-                except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):
-                    pass
-
-            # Then signal the parent
-            try:
-                getattr(parent, signal_method)()
-            except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):
-                pass
+                signal_process(child)
+            signal_process(parent)
+        # Otherwise, fall back to direct process signaling
         else:
-            # Fall back to direct process signaling
-            try:
-                getattr(process, signal_method)()
-            except Exception:
-                pass
+            signal_process(process)
 
     def _read_bytes_from_process(self, process, stream, num_bytes) -> bytes:  # type: ignore
         """Read exactly num_bytes from process stdout"""
