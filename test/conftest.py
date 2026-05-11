@@ -278,6 +278,10 @@ _LANGUAGE_PYTEST_MARKERS: dict[Language, list[MarkDecorator | Mark]] = {
     Language.PYTHON_TY: [pytest.mark.python],
     Language.RUST: [pytest.mark.rust],
     Language.TYPESCRIPT: [pytest.mark.typescript],
+    Language.BSL: [
+        pytest.mark.bsl,
+        pytest.mark.skipif(_sh.which("java") is None, reason="Java is not installed"),
+    ],
     Language.ANGULAR: [pytest.mark.angular],
     Language.HTML: [pytest.mark.html],
     Language.SCSS: [pytest.mark.scss],
@@ -330,6 +334,10 @@ def _determine_disabled_languages() -> list[Language]:
     al_tests_enabled = True
     if not al_tests_enabled:
         result.append(Language.AL)
+
+    # Disable BSL tests only when Java is not available (Java IS present in CI via actions/setup-java)
+    if _sh.which("java") is None:
+        result.append(Language.BSL)
 
     return result
 
