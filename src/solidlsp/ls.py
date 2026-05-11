@@ -8,7 +8,7 @@ import shutil
 import threading
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Hashable, Iterator
+from collections.abc import Callable, Hashable, Iterator
 from contextlib import contextmanager
 from copy import copy
 from pathlib import Path, PurePath
@@ -498,6 +498,7 @@ class SolidLanguageServer(ABC):
             whenever the format of the raw document symbols changes (typically because the language server
             improves/fixes its output).
         """
+        self._solidlsp_config = config
         self._solidlsp_settings = solidlsp_settings
         lang = self.get_language_enum_instance()
         self._custom_settings = solidlsp_settings.get_ls_specific_settings(lang)
@@ -549,13 +550,7 @@ class SolidLanguageServer(ABC):
             self._dependency_provider = self._create_dependency_provider()
             process_launch_info = self._create_process_launch_info()
         log.debug(f"Creating language server instance with {language_id=} and process launch info: {process_launch_info}")
-        self.server = StdioLanguageServer(
-            process_launch_info,
-            language=self.language,
-            determine_log_level=self._determine_log_level,
-            logger=logging_fn,
-            start_independent_lsp_process=config.start_independent_lsp_process,
-        )
+        self.server = self._create_language_server_interface(process_launch_info, logging_fn)
         """
         the low-level language server interface
         """
@@ -572,8 +567,6 @@ class SolidLanguageServer(ABC):
 
         # Create a pathspec matcher from the processed patterns
         self._ignore_spec = pathspec.PathSpec.from_lines(pathspec.patterns.GitWildMatchPattern, processed_patterns)
-
-        self._request_timeout: float | None = None
 
         self._has_waited_for_cross_file_references = False
 
@@ -599,6 +592,48 @@ class SolidLanguageServer(ABC):
                 continue
             _seen.add(additional_workspace_abs_path)
             self._additional_workspace_abs_paths.append(additional_workspace_abs_path)
+
+    def _create_dependency_provider(self) -> LanguageServerDependencyProvider:
+        """
+        Creates the dependency provider for this language server.
+
+        Subclasses should override this method to provide their specific dependency provider.
+        This method is only called if process_launch_info is not passed to __init__.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} must implement _create_dependency_provider() or pass process_launch_info to __init__()"
+        )
+
+    def _create_process_launch_info(self) -> ProcessLaunchInfo:
+        assert self._dependency_provider is not None
+        cmd = self._dependency_provider.create_launch_command()
+        env = self._dependency_provider.create_launch_command_env()
+        return ProcessLaunchInfo(cmd=cmd, cwd=self.repository_root_path, env=env)
+
+    def _create_language_server_interface(
+        self, process_launch_info: ProcessLaunchInfo, logging_fn: Callable[[str, str, StringDict | str], None] | None
+    ) -> LanguageServerInterface:
+        """
+        Creates the low-level language server interface for LSP communication.
+
+        The interface is created but not started.
+
+        The default implementation creates a StdioLanguageServer, but subclasses can override this method to create a different type
+        of interface if needed.
+
+        :param process_launch_info: process launch information
+        :param logging_fn: the trace logging function
+        :return: the interface
+        """
+        return StdioLanguageServer(
+            process_launch_info,
+            language=self.language,
+            determine_log_level=self._determine_log_level,
+            logger=logging_fn,
+            start_independent_lsp_process=self._solidlsp_config.start_independent_lsp_process,
+        )
+
+    # --- diagnostics-related functions ---
 
     def _observe_server_notification(self, method: str, params: Any) -> None:
         """
@@ -982,23 +1017,6 @@ class SolidLanguageServer(ABC):
 
         return self._filter_diagnostics(ret, start_line, end_line, min_severity)
 
-    def _create_dependency_provider(self) -> LanguageServerDependencyProvider:
-        """
-        Creates the dependency provider for this language server.
-
-        Subclasses should override this method to provide their specific dependency provider.
-        This method is only called if process_launch_info is not passed to __init__.
-        """
-        raise NotImplementedError(
-            f"{self.__class__.__name__} must implement _create_dependency_provider() or pass process_launch_info to __init__()"
-        )
-
-    def _create_process_launch_info(self) -> ProcessLaunchInfo:
-        assert self._dependency_provider is not None
-        cmd = self._dependency_provider.create_launch_command()
-        env = self._dependency_provider.create_launch_command_env()
-        return ProcessLaunchInfo(cmd=cmd, cwd=self.repository_root_path, env=env)
-
     def _get_wait_time_for_cross_file_referencing(self) -> float:
         """Meant to be overridden by subclasses for LS that don't have a reliable "finished initializing" signal.
 
@@ -1194,13 +1212,14 @@ class SolidLanguageServer(ABC):
         yield self
         self.stop()
 
-    def _start_server_process(self) -> None:
-        self.server_started = True
-        self._start_server()
-
     @abstractmethod
     def _start_server(self) -> None:
-        pass
+        """
+        Starts the low-level language server interface (i.e. self.server).
+
+        This method must ultimately call `self.server.start()` and may perform additional setup before or after starting the server,
+        such as waiting for initialization to complete or activating additional workspaces.
+        """
 
     def _get_language_id_for_file(self, relative_file_path: str) -> str:
         """
@@ -3053,7 +3072,8 @@ class SolidLanguageServer(ABC):
         :return: self for method chaining
         """
         log.info(f"Starting language server with language {self.language_server.language} for {self.language_server.repository_root_path}")
-        self._start_server_process()
+        self.server_started = True
+        self._start_server()
         return self
 
     def stop(self, shutdown_timeout: float = 2.0) -> None:
@@ -3067,6 +3087,8 @@ class SolidLanguageServer(ABC):
             self.server.stop(timeout=shutdown_timeout)
         except Exception as e:
             log.warning(f"Exception while shutting down language server: {e}")
+        finally:
+            self.server_started = False
 
     @property
     def language_server(self) -> Self:
