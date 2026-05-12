@@ -2,6 +2,9 @@
 
 Status of the `main` branch. Changes prior to the next official version change will appear here.
 
+* Language Servers:
+  - No longer store temporary files (e.g. downloads) in `~/solidlsp_tmp`; instead, use OS-specific temporary directories
+
 * Dashboard:
   - UI polish: switch UI font to Inter (with system fallbacks) and use JetBrains Mono only for code/logs/paths/identifiers; refine the light/dark palette with softer borders, clearer text hierarchy, and a more nuanced shadow/elevation system; introduce a consistent spacing scale; keep the orange accent.
   - Modal markup cleanup: extract shared CSS classes (`.modal-info`, `.modal-hint`, `.modal-prompt`, `.modal-field`, `.modal-input`, `.modal-select`, `.modal-textarea`, `.modal-actions`, `.btn-secondary`) and remove duplicated inline styles from all seven modals. Inputs and textareas get an accent-colored focus ring; the modal backdrop has a subtle blur.
